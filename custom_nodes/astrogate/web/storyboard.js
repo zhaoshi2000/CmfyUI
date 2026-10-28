@@ -5,6 +5,7 @@ const base = "/astrogate/storyboard";
 const states = {prepared: "等待参考图 / 排队中", queued: "排队中", running: "正在生成", analysing: "正在分析剧本", succeeded: "已完成", failed: "失败", blocked: "本批次未执行", unknown: "结果未知 · 可明确重绘", cancelling: "正在停止", cancelled: "已取消"};
 const kinds = {character: "人物身份", look: "服装造型", scene: "场景", scene_state: "场景状态", prop: "道具", shot: "分镜"};
 const active = new Set(["prepared", "queued", "running", "analysing", "cancelling"]);
+let activityPanel;
 const value = (node, name) => node.widgets?.find(w => w.name === name)?.value;
 const nodes = () => app.graph._nodes;
 function setValue(node, name, input) {
@@ -27,7 +28,10 @@ function element(tag, text, className) {
     return el;
 }
 function message(node, text, busy = false, error = false) {
+    const changed = node.properties.astrogate_status !== text || node.agBusy !== busy || node.agError !== error;
     node.properties.astrogate_status = text;
+    node.agBusy = busy;
+    node.agError = error;
     if (node.agStatus) {
         node.agStatus.textContent = text;
         node.agStatus.classList.toggle("busy", busy);
@@ -37,7 +41,123 @@ function message(node, text, busy = false, error = false) {
         const preview = node.widgets?.find(w => w.name === "$$node-text-preview");
         if (preview) preview.hidden = true;
     }
-    node.setDirtyCanvas(true, true);
+    if (changed) node.setDirtyCanvas(true, true);
+}
+
+const stageNames = {assets: "提取人物、场景与道具", shots: "编写分镜与提示词"};
+function logText(text) {
+    return String(text || "").replace(/sk-[A-Za-z0-9_-]{12,}/g, "[密钥已隐藏]").replace(/Bearer\s+\S+/gi, "Bearer [已隐藏]");
+}
+function activityStatus(job) {
+    if (job.status === "cancelling") return "正在停止，等待当前请求结束";
+    if (job.status === "analysing") return stageNames[job.stage] || "分析剧本";
+    if (job.status === "unknown") return "远端结果未知";
+    return states[job.status] || job.status;
+}
+function activityLines(job) {
+    const events = job.events?.length ? [...job.events] : [{time: job.created_at, message: "任务已建立"},
+        ...(job.stage ? [{time: job.stage_started_at, stage: job.stage}] : [])];
+    if (events.findLast(e => e.status)?.status !== job.status) events.push({time: job.updated_at || job.created_at, status: job.status, error: job.error});
+    return events.map(event => {
+        const timestamp = event.time ? new Date(event.time * 1000).toLocaleTimeString("zh-CN", {hour12: false}) : "--:--:--";
+        const text = [event.message, event.stage && stageNames[event.stage], event.status && activityStatus({...job, status: event.status, stage: event.stage}), event.error].filter(Boolean).join(" · ");
+        return `[${timestamp}] ${logText(text)}`;
+    }).join("\n");
+}
+function createActivityPanel() {
+    const root = element("details", undefined, "ag-activity");
+    root.open = localStorage.getItem("astrogate.activity.open") === "true";
+    const summary = element("summary");
+    const indicator = element("span", undefined, "ag-activity-indicator");
+    const title = element("span", "分镜日志 · 就绪");
+    summary.append(indicator, title);
+    const body = element("div", undefined, "ag-activity-body");
+    const picker = element("select");
+    picker.setAttribute("aria-label", "选择要查看的 AstroGate 任务");
+    const info = element("div", "当前画布暂无分镜任务", "ag-activity-info");
+    const logs = element("pre", "选择 TXT 文件并开始分析后，这里显示实时日志。", "ag-activity-log");
+    logs.setAttribute("role", "log");
+    logs.setAttribute("aria-live", "polite");
+    const controls = element("div", undefined, "ag-activity-actions");
+    const locate = element("button", "定位节点");
+    const stop = element("button", "停止此任务");
+    const copy = element("button", "复制日志");
+    const collapse = element("button", "收起");
+    const note = element("div", "每 3 秒更新 · 外部接口没有总进度百分比", "ag-activity-note");
+    controls.append(locate, stop, copy, collapse);
+    body.append(picker, info, logs, controls, note);
+    root.append(summary, body);
+    document.body.append(root);
+    let entries = [], selected = "", manual = false, connectionError = "", actionError = "", optionsKey = "";
+    const current = () => entries.find(entry => entry.job.id === selected);
+    function render() {
+        const busy = entries.filter(entry => active.has(entry.job.status));
+        const entry = current();
+        const headline = busy[0] || entry;
+        const state = headline ? activityStatus(headline.job) : "就绪";
+        title.textContent = `分镜日志 · ${connectionError ? "状态连接中断" : state}`;
+        summary.title = title.textContent;
+        root.classList.toggle("busy", busy.length > 0 && !connectionError);
+        root.classList.toggle("error", Boolean(connectionError || entry?.job.error));
+        picker.disabled = !entries.length;
+        locate.disabled = !entry;
+        stop.disabled = !entry || !active.has(entry.job.status) || entry.job.status === "cancelling" || Boolean(connectionError);
+        copy.disabled = !entry;
+        collapse.disabled = false;
+        stop.textContent = entry?.job.kind === "image" ? "停止此批次" : "停止此任务";
+        stop.title = entry?.job.kind === "image" ? "停止同一队列任务内尚未完成的图片；已发出的远端请求可能继续，返回的结果仍会保存。" : "停止所选分镜分析；已完成草稿会保留。";
+        if (!entry) {
+            info.textContent = connectionError || "当前画布暂无分镜任务";
+            logs.textContent = "选择 TXT 文件并开始分析后，这里显示实时日志。";
+            return;
+        }
+        const {job, node} = entry;
+        const start = active.has(job.status) ? job.stage_started_at || job.created_at : job.created_at;
+        const elapsed = Math.max(0, Math.floor((active.has(job.status) ? Date.now() / 1000 : job.updated_at || job.created_at) - start));
+        const transport = {connecting: "请求已发起，等待接口响应", waiting: "接口已响应，等待正文", receiving: "正在接收正文", received: "正文已接收"}[job.request_state];
+        const details = [logText(node.title), `${activityStatus(job)} · ${elapsed} 秒`,
+            job.model && `${job.model}${job.model === "gpt-5.6-terra" ? " / xhigh" : ""}`,
+            active.has(job.status) && transport,
+            job.received_chars > 0 && `已接收 ${job.received_chars.toLocaleString()} 字`,
+            active.has(job.status) && job.last_activity_at && `接口最近响应：${Math.max(0, Math.floor(Date.now() / 1000 - job.last_activity_at))} 秒前`,
+            connectionError || actionError].filter(Boolean);
+        info.textContent = details.join("\n");
+        const text = activityLines(job);
+        if (logs.textContent !== text) {
+            const atBottom = logs.scrollHeight - logs.scrollTop - logs.clientHeight < 30;
+            logs.textContent = text;
+            if (atBottom) logs.scrollTop = logs.scrollHeight;
+        }
+    }
+    picker.addEventListener("change", () => { selected = picker.value; manual = true; actionError = ""; render(); });
+    root.addEventListener("toggle", () => localStorage.setItem("astrogate.activity.open", String(root.open)));
+    for (const event of ["pointerdown", "dblclick", "wheel"]) root.addEventListener(event, e => e.stopPropagation());
+    for (const [control, action] of [
+        [locate, () => { const entry = current(); if (entry) focusNode(entry.node); }],
+        [stop, async () => { const entry = current(); if (entry) entry.job = await request(`/jobs/${entry.job.id}/cancel`, {}); }],
+        [copy, () => navigator.clipboard.writeText(info.textContent + "\n\n" + logs.textContent)],
+        [collapse, () => { root.open = false; }],
+    ]) {
+        control.type = "button";
+        control.addEventListener("click", async () => {
+            control.disabled = true;
+            try { actionError = ""; await action(); }
+            catch (error) { actionError = logText(error.message); }
+            finally { render(); }
+        });
+    }
+    return {update(next, error = "") {
+        connectionError = logText(error);
+        if (!error || next.length) entries = next.sort((a, b) => Number(active.has(b.job.status)) - Number(active.has(a.job.status)) || (b.job.updated_at || b.job.created_at) - (a.job.updated_at || a.job.created_at));
+        if (!manual || !current()) { selected = entries[0]?.job.id || ""; manual = false; }
+        const key = entries.map(e => `${e.job.id}:${e.node.title}:${e.job.status}`).join("|");
+        if (optionsKey !== key) {
+            picker.replaceChildren(...entries.map(({node, job}) => { const option = element("option", logText(`${node.title} · ${states[job.status] || job.status}`)); option.value = job.id; return option; }));
+            optionsKey = key;
+        }
+        picker.value = selected;
+        render();
+    }};
 }
 function button(node, title, action, className = "") {
     const el = element("button", title, className);
@@ -483,6 +603,8 @@ function installFrame(node) {
     node.agRefresh();
 }
 async function poll() {
+    const activityEntries = [];
+    let activityError = "";
     const frames = nodes().filter(n => n.type === "AstroGateStoryboardFrame" && value(n, "job_id"));
     const boards = nodes().filter(n => n.type === "AstroGateStoryboard");
     const projects = new Set([...frames.map(n => n.properties.astrogate_project), ...boards.map(n => value(sourceNode(n, "script") || {}, "project_id"))].filter(Boolean));
@@ -493,12 +615,14 @@ async function poll() {
             for (const node of frames.filter(n => n.properties.astrogate_project === project)) {
                 const job = jobs.get(value(node, "job_id"));
                 if (!job) continue;
+                activityEntries.push({node, job});
                 message(node, (states[job.status] || job.status) + (job.error ? ` · ${job.error}` : ""), active.has(job.status), ["failed", "unknown", "blocked"].includes(job.status));
                 if (job.saved_result) { node.properties.astrogate_images = [job.saved_result]; restorePreview(node); }
             }
             for (const node of boards.filter(n => value(sourceNode(n, "script") || {}, "project_id") === project)) {
                 const context = await analysisContext(node);
                 const job = result.jobs.find(j => j.kind === "text" && j.analysis_key === context.key);
+                if (job) activityEntries.push({node, job});
                 if (node.agAnalysisKey !== context.key) {
                     node.agAnalysisKey = context.key;
                     if (!job) message(node, "就绪，点击“分析并自动建立节点”开始。");
@@ -510,9 +634,11 @@ async function poll() {
                 }
             }
         } catch (error) {
+            activityError = `状态读取失败：${error.message}`;
             for (const node of [...frames.filter(n => n.properties.astrogate_project === project), ...boards.filter(n => value(sourceNode(n, "script") || {}, "project_id") === project)]) message(node, `状态读取失败：${error.message}`, false, true);
         }
     }
+    activityPanel?.update(activityEntries, activityError);
 }
 app.registerExtension({
     name: "AstroGate.Storyboard",
@@ -568,6 +694,7 @@ app.registerExtension({
         style.rel = "stylesheet";
         style.href = new URL("./storyboard.css", import.meta.url).href;
         document.head.append(style);
+        activityPanel = createActivityPanel();
         const bar = element("div", undefined, "ag-native-toolbar");
         const importButton = element("button", "导入 TXT → AI 分镜");
         importButton.type = "button";

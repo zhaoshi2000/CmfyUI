@@ -27,13 +27,18 @@ source_refs只能是输入段落ID和逐字连续摘自该段原文的短摘，�
 输出格式：{"shots":[{"local_id":"s1","summary":"镜头标题","source_refs":[{"paragraph_id":"输入ID","quote":null}],"story_time":"时间","scene_id":null,"participants":[{"character_id":"已知ID","look_id":null,"visible":true,"screen_position":"画面左侧","action":"动作","expression":"表情","facing":"朝向"}],"prop_ids":[],"shot_size":"中景","camera_angle":"平视","frozen_moment":"瞬间","dialogue":[],"narration":[],"mentioned":[],"image_prompt":"提示词","previous_local_id":null,"previous_reason":"","story_parent_local_id":null,"story_relation":"","inferred_details":[],"uncertainties":[],"missing_assets":[]}],"summary":"本块情节摘要，不超过600字"}。"""
 
 
-async def read_text_stream(response):
+async def read_text_stream(response, on_progress=None):
     parts, usage = [], {}
     size, finish, done = 0, None, False
+    characters, started = 0, False
+    last_report = time.monotonic()
     async for line in response.content:
         size += len(line)
         if size > 4 * 1024 * 1024:
             raise RuntimeError("文本响应超过4MB，请缩小分析范围。")
+        if on_progress and time.monotonic() - last_report >= 2:
+            on_progress(None, received_chars=characters, last_activity_at=time.time())
+            last_report = time.monotonic()
         if not line.startswith(b"data:"):
             continue
         data = line[5:].strip()
@@ -54,15 +59,21 @@ async def read_text_stream(response):
             content = choice.get("delta", {}).get("content")
             if content:
                 parts.append(content)
+                characters += len(content)
+                if on_progress and not started:
+                    on_progress("开始接收正文", request_state="receiving", received_chars=characters, last_activity_at=time.time())
+                    started = True
             finish = choice.get("finish_reason") or finish
     if not done and not finish:
         raise RuntimeError("文本流中断，远端结果未知。未自动重试。")
     if finish == "length":
         raise RuntimeError("文本输出被截断，请缩小分析范围。未自动重试。")
+    if on_progress:
+        on_progress(f"正文接收完成（{characters} 字）", request_state="received", received_chars=characters, last_activity_at=time.time())
     return "".join(parts), usage
 
 
-async def text_request(model, system, content):
+async def text_request(model, system, content, on_progress=None):
     if model not in MODELS:
         raise ValueError("请选择 gpt-6-luna 或 gpt-5.6-terra。")
     key = os.environ.get("ASTROGATE_TEXT_API_KEY", "").strip()
@@ -77,10 +88,12 @@ async def text_request(model, system, content):
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout, connect=15), trust_env=False) as session:
             async with session.post(f"{TEXT_BASE}/chat/completions", json=body,
                                     headers={"Authorization": f"Bearer {key}"}, allow_redirects=False) as response:
+                if on_progress:
+                    on_progress(f"接口响应 HTTP {response.status}", request_state="waiting", response_status=response.status, last_activity_at=time.time())
                 if response.status != 200:
                     raise RuntimeError(f"文本接口 HTTP {response.status}，未自动重试或切换模型。")
                 if response.content_type == "text/event-stream":
-                    return await read_text_stream(response)
+                    return await read_text_stream(response, on_progress)
                 raw = bytearray()
                 async for piece in response.content.iter_chunked(65536):
                     raw.extend(piece)
@@ -90,6 +103,8 @@ async def text_request(model, system, content):
         result = data["choices"][0]
         if result.get("finish_reason") == "length":
             raise RuntimeError("文本输出被截断，请缩小分析范围。未自动重试。")
+        if on_progress:
+            on_progress("正文接收完成", request_state="received", received_chars=len(result["message"]["content"]), last_activity_at=time.time())
         return result["message"]["content"], data.get("usage", {})
     except (asyncio.TimeoutError, aiohttp.ClientError):
         raise RuntimeError("文本请求断开或超时，远端结果未知。未自动重试。") from None
@@ -212,6 +227,9 @@ async def analyse(store, job_id):
     summary = job.get("summary", "")
     responses = job.get("responses", [])
     completed = job.get("completed_chunks", 0)
+    def progress(event, **fields):
+        store.update_job(job_id, event=event, **fields)
+
     if not summary:
         earlier = {c["id"] for c in project["chapters"][:project["chapters"].index(chapter)]}
         previous = next((j for j in store.jobs(project_id) if j["kind"] == "text" and j["status"] == "succeeded" and j.get("chapter_id") in earlier and j.get("summary")), None)
@@ -230,8 +248,9 @@ async def analyse(store, job_id):
                        "known_assets": known_assets(project, "\n".join(p["text"] for p in section))}
             extraction = next((r for r in responses if r["chunk"] == index and r["stage"] == "assets"), None)
             if extraction is None:
-                store.update_job(job_id, stage="assets", stage_started_at=time.time())
-                raw, usage = await text_request(job["model"], EXTRACT_PROMPT, content)
+                store.update_job(job_id, stage="assets", stage_started_at=time.time(), request_state="connecting", received_chars=0,
+                                 last_activity_at=None, response_status=None, event=f"发送素材提取请求 · {job['model']}")
+                raw, usage = await text_request(job["model"], EXTRACT_PROMPT, content, on_progress=progress)
                 extraction = {"chunk": index, "stage": "assets", "raw": raw, "usage": usage, "applied": False}
                 responses.append(extraction)
                 store.update_job(job_id, responses=responses)
@@ -244,7 +263,7 @@ async def analyse(store, job_id):
                     p.setdefault("analysis_checkpoints", []).append(checkpoint)
                 project = store.change(project_id, apply_assets)
             extraction["applied"] = True
-            store.update_job(job_id, responses=responses)
+            store.update_job(job_id, responses=responses, event="素材提取结果已保存")
             content.update(known_assets=known_assets(project, "\n".join(p["text"] for p in section)),
                            visual_style=job["style"], shot_density=job["density"])
             storyboard = next((r for r in responses if r["chunk"] == index and r["stage"] == "shots"), None)
@@ -252,8 +271,9 @@ async def analyse(store, job_id):
                 if store.job(job_id).get("cancel_requested"):
                     store.update_job(job_id, status="cancelled", error="分析已停止，素材提取结果已保存。")
                     return
-                store.update_job(job_id, stage="shots", stage_started_at=time.time())
-                raw, usage = await text_request(job["model"], SHOT_PROMPT, content)
+                store.update_job(job_id, stage="shots", stage_started_at=time.time(), request_state="connecting", received_chars=0,
+                                 last_activity_at=None, response_status=None, event=f"发送分镜脚本请求 · {job['model']}" + (" / xhigh" if job["model"] == "gpt-5.6-terra" else ""))
+                raw, usage = await text_request(job["model"], SHOT_PROMPT, content, on_progress=progress)
                 storyboard = {"chunk": index, "stage": "shots", "raw": raw, "usage": usage, "applied": False}
                 responses.append(storyboard)
                 store.update_job(job_id, responses=responses)
@@ -267,7 +287,7 @@ async def analyse(store, job_id):
                 store.change(project_id, apply_shots)
             storyboard["applied"] = True
             summary = str(draft.get("summary") or extracted.get("summary", ""))[:1200]
-            store.update_job(job_id, completed_chunks=index + 1, summary=summary, responses=responses)
+            store.update_job(job_id, completed_chunks=index + 1, summary=summary, responses=responses, event=f"第 {index + 1} 块分镜已保存（{len(draft['shots'])} 镜）")
         store.update_job(job_id, status="succeeded")
     except asyncio.CancelledError:
         store.update_job(job_id, status="unknown", error="分析已停止，当前远端请求结果未知；已完成的块和草稿仍保留。")

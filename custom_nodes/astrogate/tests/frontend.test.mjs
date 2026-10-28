@@ -7,7 +7,7 @@ import { webcrypto } from "node:crypto";
 const source = await readFile(new URL("../web/storyboard.js", import.meta.url), "utf8");
 async function load(app, extras = {}, api = {}) {
     const context = vm.createContext({queueMicrotask, structuredClone, console, JSON, Set, Map, URLSearchParams, TextEncoder, crypto: webcrypto, ...extras});
-    const module = new vm.SourceTextModule(source + "\nexport { installFold, mountGraph, changed, generate, installFrame, analysisContext, startAnalysis, showAnalysisState, poll, panelWidget };", {context});
+    const module = new vm.SourceTextModule(source + "\nexport { installFold, mountGraph, changed, generate, installFrame, analysisContext, startAnalysis, showAnalysisState, poll, panelWidget, activityStatus, activityLines, message, createActivityPanel };", {context});
     await module.link(async specifier => {
         const name = specifier.includes("app.js") ? "app" : "api";
         return new vm.SyntheticModule([name], function () { this.setExport(name, name === "app" ? app : api); }, {context});
@@ -208,4 +208,64 @@ test('middle drag over card controls is forwarded to native canvas while left cl
     assert.equal(dispatched.length,1);
     assert.equal(left.stopped,true);
     assert.equal(left.prevented,false);
+});
+
+test('activity logs distinguish stages and hide credentials when copied',async()=>{
+    const {activityLines,activityStatus}=await load({registerExtension(){}});
+    const job={status:'unknown',kind:'text',stage:'shots',created_at:1,updated_at:4,error:'Bearer private-token sk-1234567890abcdef',events:[
+        {time:1,status:'analysing',stage:'assets'}, {time:2,message:'接口响应 HTTP 200'}, {time:3,stage:'shots'}]};
+    const log=activityLines(job);
+    assert.match(log,/提取人物/);
+    assert.match(log,/HTTP 200/);
+    assert.match(log,/编写分镜/);
+    assert.match(log,/结果未知/);
+    assert.doesNotMatch(log,/private-token|1234567890abcdef/);
+    assert.equal(activityStatus({...job,status:'succeeded'}),'已完成');
+});
+
+test('unchanged task status does not keep invalidating the canvas',async()=>{
+    let dirty=0;
+    const node={properties:{},agStatus:{textContent:'',classList:{toggle(){}}},setDirtyCanvas(){dirty++;}};
+    const {message}=await load({registerExtension(){}});
+    message(node,'已完成');
+    message(node,'已完成');
+    assert.equal(dirty,1);
+    message(node,'正在生成',true);
+    assert.equal(dirty,2);
+});
+
+test('compact log panel keeps logs when collapsed and cancels only the selected text task',async()=>{
+    const elements=[];
+    class Element {
+        constructor(tag){this.tag=tag;this.children=[];this.events={};this.textContent='';this.scrollTop=0;this.scrollHeight=0;this.clientHeight=0;this.classList={toggle(){}};elements.push(this);}
+        append(...items){this.children.push(...items);}
+        replaceChildren(...items){this.children=items;}
+        setAttribute(){}
+        addEventListener(name,fn){this.events[name]=fn;}
+    }
+    const calls=[];
+    const document={createElement:tag=>new Element(tag),body:new Element('body')};
+    const api={fetchApi:async(path)=>{calls.push(path);return {ok:true,json:async()=>({id:'job-b',status:'cancelling',kind:'text',created_at:1})};}};
+    const {createActivityPanel}=await load({registerExtension(){}},{document,FormData:class{},localStorage:{getItem:()=>null,setItem(){}},navigator:{clipboard:{writeText:async text=>calls.push(text)}}},api);
+    const panel=createActivityPanel();
+    const a={node:{id:1,title:'剧本 A'},job:{id:'job-a',kind:'text',status:'analysing',created_at:1,updated_at:2}};
+    const b={node:{id:2,title:'剧本 B'},job:{id:'job-b',kind:'text',status:'analysing',created_at:1,updated_at:3,stage:'shots'}};
+    panel.update([a,b]);
+    const root=elements.find(e=>e.tag==='details');
+    const log=elements.find(e=>e.tag==='pre');
+    const collapse=elements.find(e=>e.textContent==='收起');
+    const stop=elements.find(e=>e.textContent==='停止此任务');
+    assert.equal(root.open,false);
+    const before=log.textContent;
+    root.open=true;
+    await collapse.events.click();
+    assert.equal(root.open,false);
+    assert.equal(log.textContent,before);
+    assert.equal(collapse.disabled,false);
+    await stop.events.click();
+    assert.deepEqual(calls,['/astrogate/storyboard/jobs/job-b/cancel']);
+    assert.equal(stop.disabled,true);
+    assert.equal(a.job.status,'analysing');
+    panel.update([]);
+    assert.match(log.textContent,/选择 TXT/);
 });

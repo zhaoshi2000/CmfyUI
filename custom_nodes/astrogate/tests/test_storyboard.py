@@ -242,6 +242,23 @@ async def test_text_model_configuration_keeps_channels_separate(modules, aiohttp
     assert all("response_format" not in c for c in calls)
 
 
+def test_job_events_survive_reload_without_logging_every_progress_update(modules, project):
+    store = modules.store
+    job = store.add_job(project['id'], {'kind': 'text'})
+    store.update_job(job['id'], status='analysing', stage='assets', event='发送素材提取请求')
+    for count in range(5):
+        store.update_job(job['id'], received_chars=count, last_activity_at=123)
+    saved = store.job(job['id'])
+    assert len(saved['events']) == 2
+    assert saved['events'][-1]['stage'] == 'assets'
+    store.update_job(job['id'], status='failed', error='文本接口 HTTP 503')
+    reloaded = modules.domain.Store(store.root, store.input_dir).job(job['id'])
+    assert reloaded['events'][-1]['error'] == '文本接口 HTTP 503'
+    for count in range(125):
+        store.update_job(job['id'], event=f'阶段 {count}')
+    assert len(store.job(job['id'])['events']) == 120
+
+
 async def test_text_stream_handles_split_utf8_keepalive_and_usage(modules, aiohttp_server, monkeypatch):
     calls = []
     async def handle(request):
@@ -264,10 +281,15 @@ async def test_text_stream_handles_split_utf8_keepalive_and_usage(modules, aioht
     server = await aiohttp_server(app)
     monkeypatch.setattr(modules.analysis, "TEXT_BASE", str(server.make_url("/")).rstrip("/"))
     monkeypatch.setenv("ASTROGATE_TEXT_API_KEY", "text-only")
-    text, usage = await modules.analysis.text_request("gpt-5.6-terra", "system", {})
+    progress = []
+    text, usage = await modules.analysis.text_request("gpt-5.6-terra", "system", {}, on_progress=lambda event, **fields: progress.append((event, fields)))
     assert modules.node.json.loads(text) == {"summary": "雨夜相遇"}
     assert usage == {"completion_tokens": 12}
     assert len(calls) == 1
+    assert progress[0][1]['response_status'] == 200
+    assert any(fields.get('request_state') == 'receiving' for _, fields in progress)
+    assert progress[-1][1]['received_chars'] == len(text)
+    assert all('雨夜' not in (event or '') for event, _ in progress)
 
 
 @pytest.mark.parametrize("ending,error", [
@@ -310,7 +332,7 @@ async def test_configured_text_timeout_stays_unknown_without_retry(modules, aioh
 async def test_analysis_resume_keeps_applied_asset_checkpoint(modules, project, monkeypatch):
     ref = project["shots"][0]["source_refs"]
     calls = []
-    async def first(model, system, content):
+    async def first(model, system, content, on_progress=None):
         calls.append(system)
         if system == modules.analysis.EXTRACT_PROMPT:
             return modules.node.json.dumps({"assets": [{"local_id": "lin", "existing_id": "林夏", "kind": "character", "source_refs": ref}]}), {}
@@ -321,7 +343,7 @@ async def test_analysis_resume_keeps_applied_asset_checkpoint(modules, project, 
     await modules.analysis.analyse(modules.store, job["id"])
     assert modules.store.job(job["id"])["status"] == "unknown"
 
-    async def resume(model, system, content):
+    async def resume(model, system, content, on_progress=None):
         calls.append(system)
         assert system == modules.analysis.SHOT_PROMPT
         return '{"shots":[],"summary":"两人相遇"}', {}
@@ -344,7 +366,7 @@ async def test_analysis_keeps_paragraph_when_ai_paraphrases_quote(modules, proje
     job = modules.store.add_job(project["id"], {"kind": "text", "chapter_id": project["chapters"][0]["id"],
         "model": "gpt-5.6-terra", "style": "写实", "density": "精细", "status": "failed",
         "responses": [{"chunk": 0, "stage": "assets", "raw": extraction, "applied": False}]})
-    async def request(model, system, content):
+    async def request(model, system, content, on_progress=None):
         assert system == modules.analysis.SHOT_PROMPT
         return storyboard, {}
     monkeypatch.setattr(modules.analysis, "text_request", request)
@@ -503,7 +525,7 @@ def test_native_unknown_requires_explicit_redraw(modules, project):
 async def test_native_cancel_stops_before_next_text_stage(modules, project, monkeypatch):
     job = modules.store.add_job(project['id'], {'kind': 'text', 'chapter_id': project['chapters'][0]['id'], 'model': 'gpt-5.6-terra', 'style': '写实', 'density': '精细'})
     calls = []
-    async def text_request(model, system, content):
+    async def text_request(model, system, content, on_progress=None):
         calls.append(system)
         modules.store.update_job(job['id'], cancel_requested=True)
         return '{"assets":[],"summary":"已提取"}', {}

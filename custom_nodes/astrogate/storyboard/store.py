@@ -266,6 +266,7 @@ class Store:
 
     def add_job(self, project_id, data):
         job = {"id": new_id(), "project_id": project_id, "created_at": time.time(), "status": "prepared", **data}
+        job["events"] = [{"time": job["created_at"], "status": job["status"]}]
         with self.connect() as db:
             db.execute("INSERT INTO jobs VALUES (?, ?, ?)", (job["id"], project_id, json.dumps(job, ensure_ascii=False)))
         return job
@@ -291,7 +292,17 @@ class Store:
             job = json.loads(row[0])
             if expected_status is not None and job["status"] not in expected_status:
                 raise ValueError("任务已执行或取消，不能重复提交；请查看历史结果。")
-            job.update(fields, updated_at=time.time())
+            now = time.time()
+            event = {"time": now}
+            message = fields.pop("event", None)
+            for field in ("status", "stage", "error"):
+                if fields.get(field) is not None and fields[field] != job.get(field):
+                    event[field] = fields[field]
+            if message:
+                event["message"] = message
+            if len(event) > 1:
+                job["events"] = [*job.get("events", []), event][-120:]
+            job.update(fields, updated_at=now)
             db.execute("UPDATE jobs SET data=? WHERE id=?", (json.dumps(job, ensure_ascii=False), job_id))
         return job
 

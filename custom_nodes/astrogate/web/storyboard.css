@@ -22,3 +22,22 @@
 .ag-hint{color:#92a8b9;font-size:11px;margin:5px 0;overflow-wrap:anywhere}
 .ag-file-info{white-space:pre-wrap;max-height:64px;overflow:auto;margin-bottom:10px;color:#bcd3e5}
 @media(max-width:900px){.ag-native-toolbar{left:110px;top:105px}}
+.ag-activity{position:fixed;left:76px;bottom:20px;z-index:45;width:300px;max-width:calc(100vw - 100px);box-sizing:border-box;background:#18212bed;color:#e1e8ed;border:1px solid #405265;border-radius:9px;box-shadow:0 5px 22px #0005;font:12px/1.5 system-ui,sans-serif}
+.ag-activity[open]{width:380px}
+.ag-activity>summary{display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;padding:9px 12px;user-select:none}
+.ag-activity>summary::-webkit-details-marker{display:none}
+.ag-activity>summary:after{content:'展开';margin-left:auto;font-size:11px;color:#a4c5dc;flex-shrink:0}
+.ag-activity[open]>summary:after{content:'收起'}
+.ag-activity>summary>span:nth-child(2){white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ag-activity-indicator{width:9px;height:9px;flex:0 0 9px;box-sizing:content-box;background:#7a97ac;border:2px solid transparent;border-radius:50%}
+.ag-activity.busy .ag-activity-indicator{background:none;border-color:#44576a;border-top-color:#68ccff;animation:ag-spin .9s linear infinite}
+.ag-activity.error .ag-activity-indicator{background:#ef927f;animation:none}
+.ag-activity-body{padding:0 12px 11px;max-height:60vh;overflow:auto}
+.ag-activity select{box-sizing:border-box;width:100%;background:#202c38;color:inherit;border:1px solid #455a6d;border-radius:5px;padding:5px;font:inherit}
+.ag-activity-info{margin:8px 0;white-space:pre-wrap;overflow-wrap:anywhere;color:#c4d8e8}
+.ag-activity-log{box-sizing:border-box;max-height:180px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#101720;border-radius:5px;padding:8px;margin:8px 0;font:11px/1.65 ui-monospace,monospace;user-select:text}
+.ag-activity-actions{display:flex;gap:5px;flex-wrap:wrap}
+.ag-activity button{font:inherit;color:inherit;background:#283746;border:1px solid #455a6d;border-radius:5px;padding:5px 8px;cursor:pointer}
+.ag-activity button:disabled{opacity:.45;cursor:default}
+.ag-activity button:focus-visible,.ag-activity>summary:focus-visible{outline:2px solid #68ccff;outline-offset:2px}
+.ag-activity-note{font-size:10px;color:#91a8bc;margin-top:7px}
