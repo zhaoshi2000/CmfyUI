@@ -1,0 +1,431 @@
+import asyncio
+import base64
+import binascii
+import json
+import os
+import secrets
+import hashlib
+from contextlib import asynccontextmanager
+from io import BytesIO
+from pathlib import Path
+
+import aiohttp
+import numpy as np
+import torch
+from PIL import Image, ImageOps
+
+import folder_paths
+from comfy_api.latest import ComfyExtension, io, ui
+from server import PromptServer
+
+from .storyboard.graph import render_prompt, semantic_hash, snapshot
+from .storyboard.native import analyse_native
+from .storyboard.service import get_store, register_routes
+from .storyboard.store import image_hash, invalidate
+
+
+API_BASE = os.environ.get("ASTROGATE_IMG_API_BASE", "https://img.astrogate.sbs/internal/astrogate/v1").rstrip("/")
+WEB_DIRECTORY = "./web"
+KEY_FILE = Path(folder_paths.base_path) / ".secrets" / "astrogate-img-api-key"
+ASPECT_SIZES = {
+    "1:1": (1024, 1024), "2:3": (1024, 1536), "3:2": (1536, 1024),
+    "4:3": (1280, 960), "3:4": (960, 1280), "16:9": (1536, 864),
+    "9:16": (864, 1536), "4:5": (1024, 1280), "5:4": (1280, 1024),
+    "2:1": (1536, 768), "1:2": (768, 1536), "21:9": (1792, 768),
+    "9:21": (768, 1792),
+}
+RESOLUTION_EDGES = {"1K": 1024, "2K": 2048, "3K": 3072, "4K": 3840}
+VIEW_PROMPTS = {
+    "自由": "",
+    "正面": "生成单独一张人物正面视图，镜头正对人物，全身从头到脚完整入画，避免三分之四侧面。",
+    "背面": "生成单独一张人物背面视图，镜头位于人物身后，背部朝向镜头，不回头，全身完整入画。",
+    "左侧": "生成单独一张人物自身左侧视图，镜头位于人物左侧，左耳和身体左侧可见，严格90度侧面，全身完整入画。",
+    "右侧": "生成单独一张人物自身右侧视图，镜头位于人物右侧，右耳和身体右侧可见，严格90度侧面，全身完整入画。",
+    "配饰细节": "生成单独一张服饰与配饰细节图，清晰展示本次要求的饰品、衣物或随身物件，保留材质、纹样、颜色、形状和佩戴位置。",
+}
+
+
+class FrameQueue:
+    def __init__(self):
+        self.lock = None
+        self.waiters = 0
+
+    @asynccontextmanager
+    async def slot(self):
+        if self.lock is None:
+            self.lock = asyncio.Lock()
+        self.waiters += 1
+        try:
+            async with self.lock:
+                yield
+        finally:
+            self.waiters -= 1
+            if not self.waiters:
+                self.lock = None
+
+
+frame_queue = FrameQueue()
+
+
+def read_api_key():
+    key = os.environ.get("ASTROGATE_IMG_API_KEY", "").strip()
+    if not key and KEY_FILE.is_file():
+        key = KEY_FILE.read_text(encoding="utf-8").strip()
+    if not key:
+        raise RuntimeError("请配置 ASTROGATE_IMG_API_KEY，或将接口密钥保存到 .secrets/astrogate-img-api-key。")
+    return key
+
+
+def output_dimensions(aspect_ratio, resolution):
+    width, height = ASPECT_SIZES[aspect_ratio]
+    if resolution == "original":
+        return width, height
+    edge = RESOLUTION_EDGES[resolution]
+    if width >= height:
+        return edge, max(2, round(edge * height / width / 2) * 2)
+    return max(2, round(edge * width / height / 2) * 2), edge
+
+
+def encode_references(reference_images):
+    batches = [batch for batch in (reference_images or {}).values() if batch is not None]
+    if sum(batch.shape[0] for batch in batches) > 8:
+        raise ValueError("AstroGate 最多支持 8 张参考图，包含输入批次中的所有图片。")
+    images = []
+    total_bytes = 0
+    for batch in batches:
+        for tensor in batch:
+            if tensor.shape[0] * tensor.shape[1] > 24_000_000:
+                raise ValueError("单张参考图不能超过 2400 万像素，请先连接图像缩放节点。")
+            array = np.clip(tensor.detach().cpu().numpy() * 255, 0, 255).round().astype(np.uint8)
+            with BytesIO() as buffer:
+                Image.fromarray(array).save(buffer, format="PNG")
+                data = buffer.getvalue()
+            total_bytes += len(data)
+            if len(data) > 32 * 1024 * 1024 or total_bytes > 50 * 1024 * 1024:
+                raise ValueError("参考图单张不能超过 32 MB，合计不能超过 50 MB。")
+            images.append({"b64_json": base64.b64encode(data).decode("ascii"), "filename": f"reference-{len(images) + 1}.png", "mime_type": "image/png"})
+    return images
+
+
+async def generate_image(payload, edit):
+    key = read_api_key()
+    operation = "edits" if edit else "generations"
+    timeout = aiohttp.ClientTimeout(total=300, connect=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
+            async with session.post(f"{API_BASE}/images/{operation}", json=payload,
+                                    headers={"Authorization": f"Bearer {key}"}, allow_redirects=False) as response:
+                if response.status != 200:
+                    hints = {401: "接口密钥无效", 403: "接口访问被拒绝", 409: "请求已提交，请稍后确认结果", 429: "接口繁忙或额度不足"}
+                    raise RuntimeError(f"AstroGate HTTP {response.status}：{hints.get(response.status, '图片服务未完成请求')}。")
+                raw = bytearray()
+                async for chunk in response.content.iter_chunked(1024 * 1024):
+                    raw.extend(chunk)
+                    if len(raw) > 48 * 1024 * 1024:
+                        raise RuntimeError("AstroGate 图片响应超过大小限制。")
+        return json.loads(raw)
+    except asyncio.TimeoutError:
+        raise RuntimeError("AstroGate 图片请求超时，服务端可能仍在生成；本次未自动重试。") from None
+    except aiohttp.ClientError:
+        raise RuntimeError("无法连接 AstroGate 图片接口，请检查网络或 SSH 隧道；本次未自动重试。") from None
+    except (ValueError, UnicodeError):
+        raise RuntimeError("AstroGate 图片接口返回了无效 JSON。") from None
+
+
+def decode_image(response, target=None):
+    items = response.get("data") if isinstance(response, dict) else None
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+        raise RuntimeError("AstroGate 未返回有效图片。")
+    try:
+        encoded = items[0].get("b64_json")
+        if not isinstance(encoded, str) or len(encoded) > 45 * 1024 * 1024:
+            raise ValueError()
+        data = base64.b64decode(encoded, validate=True)
+        if len(data) > 32 * 1024 * 1024:
+            raise ValueError()
+        with Image.open(BytesIO(data)) as opened:
+            if opened.width * opened.height > 24_000_000:
+                raise ValueError()
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+            if target is not None and image.size != target:
+                image = ImageOps.fit(image, target, method=Image.Resampling.LANCZOS)
+            array = np.array(image, dtype=np.float32) / 255.0
+        return torch.from_numpy(array).unsqueeze(0)
+    except (ValueError, binascii.Error, OSError, Image.DecompressionBombError):
+        raise RuntimeError("AstroGate 返回的图片无法读取或超过大小限制。") from None
+
+
+class AstroGateImage(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="AstroGateImage",
+            display_name="AstroGate AI 生成图像",
+            category="image",
+            not_idempotent=True,
+            has_intermediate_output=True,
+            description="通过 AstroGate 生成图像。把前一个节点的图像接到参考图即可续图；多视角可共用基准图和统一设定。输出可接预览、保存或后续生成节点。",
+            inputs=[
+                io.String.Input("prompt", display_name="提示词", default="", multiline=True,
+                                tooltip="描述要生成的画面，也可连接 STRING 文本节点。"),
+                io.Combo.Input("model", display_name="模型", options=["gpt-image-2"], default="gpt-image-2"),
+                io.Combo.Input("aspect_ratio", display_name="画幅比例", options=list(ASPECT_SIZES), default="16:9"),
+                io.Combo.Input("resolution", display_name="分辨率", options=["original", *RESOLUTION_EDGES], default="original",
+                               tooltip="original 保留接口原图；1K/2K/3K/4K 长边为 1024/2048/3072/3840。接口返回尺寸不符时会按所选比例裁切缩放。"),
+                io.Combo.Input("quality", display_name="质量", options=["low", "medium", "high"], default="medium"),
+                io.Autogrow.Input("reference_images", optional=True,
+                                  template=io.Autogrow.TemplateNames(io.Image.Input("reference", display_name="参考图"),
+                                                                    names=[f"reference_{i}" for i in range(1, 9)], min=0),
+                                  tooltip="可不连接；连接后使用图生图。支持多个输入或图像批次，合计最多 8 张。"),
+                io.String.Input("consistency", display_name="统一设定", optional=True, default="", multiline=True,
+                                tooltip="可连接同一个文本节点，描述人物脸型、发型、服装、配饰和画风。第1张参考图作为基准，后续参考图作补充。"),
+                io.Combo.Input("view", display_name="视角", optional=True, options=list(VIEW_PROMPTS), default="自由",
+                               tooltip="每个节点输出一张图；左/右侧指人物自身的左/右侧。场景续图或自定义角度选自由。"),
+                io.Int.Input("generation_id", display_name="重绘编号", optional=True, default=0, min=-1, max=2147483647,
+                             socketless=True,
+                             tooltip="编号不变时可复用 ComfyUI 缓存；修改编号重新生成，-1 每次重画。这不是模型随机种子。重启或清缓存后可能重新生成，定稿请保存后加载。"),
+            ],
+            outputs=[io.Image.Output(display_name="图像")],
+            hidden=[io.Hidden.unique_id],
+        )
+
+    @classmethod
+    def fingerprint_inputs(cls, generation_id=-1, **kwargs):
+        return float("nan") if generation_id is None or generation_id < 0 else generation_id
+
+    @classmethod
+    async def execute(cls, prompt, model, aspect_ratio, resolution, quality, reference_images=None,
+                      consistency="", view="自由", generation_id=-1):
+        width, height = output_dimensions(aspect_ratio, resolution)
+        references = encode_references(reference_images)
+        parts = []
+        if references and (consistency.strip() or view != "自由"):
+            parts.append("参考约束：第1张参考图是主体身份、服装配饰和画风的基准，后续参考图仅补充动作、构图或细节。"
+                         "除本次明确要求修改的内容外，保持人物脸型、年龄、发型、服装层次、颜色和配饰一致。"
+                         "配饰左右以人物自身为准，不要镜像或互换左右。不可见部分合理补全；本次明确的修改要求优先。")
+        if consistency.strip():
+            parts.append(f"统一设定：\n{consistency}")
+        if view != "自由":
+            parts.append(f"视角要求：{VIEW_PROMPTS[view]}")
+        parts.append(prompt)
+        combined_prompt = "\n\n".join(parts)
+        if not combined_prompt.strip() or len(combined_prompt) > 16000:
+            raise ValueError("请填写提示词或统一设定；合并视角要求后的提示词最多 16000 个字符。")
+        payload = {"model": model, "prompt": combined_prompt, "size": f"{width}x{height}", "quality": quality,
+                   "n": 1, "stream": False, "response_format": "b64_json", "gateway_request_id": secrets.token_hex(32)}
+        if references:
+            payload["images"] = references
+        node_id = cls.hidden.unique_id
+        if node_id:
+            PromptServer.instance.send_progress_text("正在生成图像，请稍候…", node_id)
+        status = "图像生成失败或已取消，请查看错误信息"
+        try:
+            response = await generate_image(payload, bool(references))
+            image = decode_image(response, (width, height) if resolution != "original" else None)
+            status = "图像生成完成"
+        finally:
+            if node_id:
+                PromptServer.instance.send_progress_text(status, node_id)
+        return io.NodeOutput(image, ui=ui.PreviewImage(image))
+
+
+class AstroGateStoryboardFrame(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="AstroGateStoryboardFrame", display_name="AstroGate 分镜帧", category="image/AstroGate",
+            description="图片和提示词同在一个原生节点。IMAGE 是实际参考图；剧情线只读取前情文本，不触发前镜重画。",
+            is_output_node=True, not_idempotent=True,
+            inputs=[io.String.Input("prompt", display_name="提示词", multiline=True, default=""),
+                    io.String.Input("job_id", display_name="任务 ID", default="", socketless=True),
+                    io.Autogrow.Input("reference_images", optional=True,
+                                      template=io.Autogrow.TemplateNames(io.Image.Input("reference", lazy=True),
+                                                                        names=[f"reference_{i}" for i in range(1, 9)], min=0)),
+                    io.String.Input("element_id", optional=True, default="", socketless=True),
+                    io.Combo.Input("aspect_ratio", display_name="画幅", optional=True, options=list(ASPECT_SIZES), default="16:9"),
+                    io.Combo.Input("resolution", display_name="分辨率", optional=True, options=["original", *RESOLUTION_EDGES], default="4K"),
+                    io.Combo.Input("quality", display_name="质量", optional=True, options=["low", "medium", "high"], default="high"),
+                    io.Custom("ASTROGATE_BOARD").Input("board", display_name="分镜脚本", optional=True, lazy=True, raw_link=True),
+                    io.Custom("ASTROGATE_STORY").Input("story_context", display_name="剧情承接", optional=True, lazy=True, raw_link=True)],
+            outputs=[io.Image.Output(display_name="图像"), io.Custom("ASTROGATE_STORY").Output(display_name="剧情")],
+            hidden=[io.Hidden.unique_id, io.Hidden.prompt, io.Hidden.extra_pnginfo])
+
+    @classmethod
+    def check_lazy_status(cls, job_id="", reference_images=None, **kwargs):
+        if not job_id or get_store().job(job_id)["status"] == "succeeded":
+            return []
+        # V3 wraps an empty Autogrow group as ({}, input_key) during lazy checks.
+        if isinstance(reference_images, tuple):
+            reference_images = reference_images[0]
+        return [key for value, key in (reference_images or {}).values() if value is None]
+
+    @classmethod
+    async def execute(cls, prompt, job_id, reference_images=None, element_id="", aspect_ratio=None, resolution=None, quality=None, board=None, story_context=None):
+        if not job_id:
+            return io.NodeOutput(block_execution="图片尚未生成，请点击卡片上的“生成图像”。")
+        async with frame_queue.slot():
+            return await cls._execute_frame(prompt, job_id, reference_images, element_id, aspect_ratio, resolution, quality, board, story_context)
+
+    @classmethod
+    async def _execute_frame(cls, prompt, job_id, reference_images=None, element_id="", aspect_ratio=None, resolution=None, quality=None, board=None, story_context=None):
+        store = get_store()
+        job = store.job(job_id)
+        if element_id and element_id != job["owner_id"]:
+            raise ValueError("任务与图片节点不匹配，请重新生成。")
+        story_output = {"project_id": job["project_id"], "element_id": job["owner_id"], "summary": job["snapshot"]["shot"].get("summary", "")}
+        if job.get("native"):
+            graph = cls.hidden.prompt or {}
+            if board:
+                analysis_inputs = graph[board[0]]["inputs"]
+                source = graph[analysis_inputs["script"][0]]["inputs"]
+                if source["project_id"] != job["project_id"]:
+                    raise ValueError("图片与所连分镜脚本不属于同一项目。")
+            if story_context:
+                previous_id = graph[story_context[0]]["inputs"].get("element_id")
+                if previous_id != job["snapshot"].get("story_parent_id"):
+                    raise ValueError("剧情连线已改变，请点击生成建立新的快照。")
+            if job["status"] != "succeeded":
+                for key, value in (("aspect_ratio", aspect_ratio), ("resolution", resolution), ("quality", quality)):
+                    if value is not None and value != job["settings"][key]:
+                        raise ValueError("图片参数已改变，请点击生成建立新的任务。")
+        if prompt not in (job["prompt"], job["snapshot"]["shot"]["image_prompt"]):
+            raise ValueError("提示词已修改，请点击卡片上的生成按钮建立新任务。")
+        if job["status"] == "succeeded":
+            with Image.open(store.image_path(job["result_image"]["file"])) as opened:
+                image = torch.from_numpy(np.array(opened.convert("RGB"), dtype=np.float32) / 255).unsqueeze(0)
+            saved = job["saved_result"]
+            return io.NodeOutput(image, story_output, ui=ui.SavedImages([ui.SavedResult(saved["filename"], saved["subfolder"], io.FolderType(saved["type"]))]))
+        if job["status"] not in ("prepared", "queued"):
+            raise RuntimeError("此任务不能重复发送。请查看任务状态；结果未知时不会自动重试。")
+        ordered = dict(sorted((reference_images or {}).items(), key=lambda item: int(item[0].rsplit("_", 1)[1])))
+        references = encode_references(ordered)
+        expected = job["references"]
+        if job.get("native"):
+            resolved = []
+            for entry, batch in ordered.items():
+                if batch is None:
+                    continue
+                spec = next((r for r in expected if r["slot"] == f"reference_images.{entry}"), None)
+                if spec is None:
+                    raise ValueError("参考连线已改变，请重新点击生成。")
+                for index in range(batch.shape[0]):
+                    ref = {**spec}
+                    if batch.shape[0] > 1:
+                        ref["purpose"] += f"（批次第{index + 1}张）"
+                    resolved.append(ref)
+            if {r["slot"] for r in resolved} != {r["slot"] for r in expected}:
+                raise ValueError("参考连线已改变，请重新点击生成。")
+            expected = resolved
+        if len(references) != len(expected):
+            raise ValueError("参考图数量与生成计划不符，请重新建立连线。")
+        for ref, binding in zip(references, expected):
+            if binding.get("job_id") and not job.get("native"):
+                upstream = store.job(binding["job_id"])
+                if upstream["status"] != "succeeded":
+                    raise ValueError("前帧尚未成功保存。")
+                binding["image"] = upstream["result_image"]
+            with Image.open(BytesIO(base64.b64decode(ref["b64_json"]))) as opened:
+                if job.get("native"):
+                    binding["image"] = {"hash": image_hash(opened), "width": opened.width, "height": opened.height}
+                elif image_hash(opened) != binding["image"]["hash"]:
+                    raise ValueError("参考图顺序或内容与计划不符，请更新素材引用后重新生成。")
+        settings = job["settings"]
+        width, height = output_dimensions(settings["aspect_ratio"], settings["resolution"])
+        payload = {"model": "gpt-image-2", "prompt": job["prompt"], "size": f"{width}x{height}", "quality": settings["quality"],
+                   "n": 1, "stream": False, "response_format": "b64_json", "gateway_request_id": job["gateway_request_id"]}
+        if references:
+            payload["images"] = references
+        if job.get("native"):
+            payload["prompt"] = render_prompt(job["snapshot"], expected)
+        read_api_key()
+        request_path = store.root / "requests" / f"{job['id']}.json"
+        request_path.parent.mkdir(exist_ok=True)
+        serialized = json.dumps(payload, ensure_ascii=False).encode()
+        request_path.write_bytes(serialized)
+        store.update_job(job_id, expected_status=("prepared", "queued"), status="running", references=expected,
+                         prompt=payload["prompt"], request_hash=hashlib.sha256(serialized).hexdigest())
+        node_id = cls.hidden.unique_id
+        if node_id:
+            PromptServer.instance.send_progress_text("正在生成分镜帧…", node_id)
+        try:
+            response = await generate_image(payload, bool(references))
+            image = decode_image(response, (width, height) if settings["resolution"] != "original" else None)
+            saved = ui.ImageSaveHelper.save_images(image, f"AstroGate/{job['project_id']}/{job['id']}", io.FolderType.output, cls)[0]
+            output_file = Path(folder_paths.get_output_directory()) / saved.subfolder / saved.filename
+            stored_image = store.save_image(job["project_id"], output_file.read_bytes())
+            store.update_job(job_id, status="succeeded", result_image=stored_image, saved_result=dict(saved))
+
+            def completed(project):
+                if job["owner_type"] != "shot":
+                    return
+                shot = next((s for s in project["shots"] if s["id"] == job["owner_id"]), None)
+                if shot:
+                    invalidate(project, [s["id"] for s in project["shots"] if s.get("previous_shot_id") == shot["id"]])
+                    shot["latest_job_id"] = job_id
+                    shot["stale"] = (shot["image_prompt"] != job["snapshot"]["shot"]["image_prompt"]) if job.get("native") else semantic_hash(snapshot(project, shot)) != job["fingerprint"]
+                    for ref in expected:
+                        if ref.get("previous_shot_id"):
+                            previous = next(s for s in project["shots"] if s["id"] == ref["previous_shot_id"])
+                            if previous.get("latest_job_id") != ref["job_id"] or previous.get("stale"):
+                                shot["stale"] = True
+            store.change(job["project_id"], completed)
+            if node_id:
+                PromptServer.instance.send_progress_text("已保存分镜帧", node_id)
+            return io.NodeOutput(image, story_output, ui=ui.SavedImages([saved]))
+        except (RuntimeError, ValueError, OSError, asyncio.CancelledError):
+            # A failed response cannot prove that the provider did not generate/bill the image.
+            if store.job(job_id)["status"] != "succeeded":
+                store.update_job(job_id, status="unknown", error="请求已发出，结果未确认；未自动重试。")
+            if node_id:
+                PromptServer.instance.send_progress_text("结果未确认，请查看任务记录", node_id)
+            raise
+
+
+class AstroGateTXT(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(node_id="AstroGateTXT", display_name="导入 TXT 剧本", category="text/AstroGate",
+                         description="点击节点里的选择 TXT 文件，将剧本输出连接到 AI 分镜脚本节点。",
+                         inputs=[io.String.Input("project_id", default="", socketless=True)],
+                         outputs=[io.Custom("ASTROGATE_SCRIPT").Output(display_name="剧本"), io.String.Output(display_name="原文")])
+
+    @classmethod
+    def execute(cls, project_id):
+        project = get_store().get(project_id)
+        return io.NodeOutput({"project_id": project_id, "source_id": project["source"]["id"]}, project["source"]["text"])
+
+
+class AstroGateStoryboard(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(node_id="AstroGateStoryboard", display_name="AI 分镜脚本 · 自动建图", category="text/AstroGate",
+                         is_output_node=True, not_idempotent=True,
+                         inputs=[io.Custom("ASTROGATE_SCRIPT").Input("script", display_name="TXT 剧本"),
+                                 io.Combo.Input("text_model", display_name="文本模型", options=["gpt-5.6-terra", "gpt-6-luna"], default="gpt-5.6-terra"),
+                                 io.Int.Input("chapter", display_name="章节序号", default=1, min=1),
+                                 io.String.Input("style", display_name="画风设定", default="写实电影，自然摄影质感，所有人物和场景使用同一画风", multiline=True),
+                                 io.String.Input("density", display_name="拆镜要求", default="精细拆镜，保留关键动作、对话反应、空间关系和必要空镜，每镜一张独立关键帧", multiline=True),
+                                 io.Int.Input("analysis_revision", display_name="重写编号", default=0, min=0)],
+                         outputs=[io.Custom("ASTROGATE_BOARD").Output(display_name="分镜脚本"), io.String.Output(display_name="脚本 JSON")],
+                         hidden=[io.Hidden.unique_id])
+
+    @classmethod
+    async def execute(cls, script, text_model, chapter, style, density, analysis_revision=0):
+        if cls.hidden.unique_id:
+            PromptServer.instance.send_progress_text("AI 正在分析剧本、编写分镜与提示词…", cls.hidden.unique_id)
+        board = await analyse_native(get_store(), script["project_id"], chapter, text_model, style, density, analysis_revision)
+        project = get_store().get(board["project_id"])
+        shots = [s for s in project["shots"] if s.get("analysis_id") == board["analysis_id"]]
+        if cls.hidden.unique_id:
+            PromptServer.instance.send_progress_text(f"已完成 {len(shots)} 镜，正在自动建立节点与连线", cls.hidden.unique_id)
+        return io.NodeOutput(board, json.dumps(shots, ensure_ascii=False, indent=2), ui={"astrogate_board": [board], "astrogate_summary": [f"已完成 {len(shots)} 个镜头"]})
+
+
+class AstroGateExtension(ComfyExtension):
+    async def get_node_list(self):
+        return [AstroGateImage, AstroGateStoryboardFrame, AstroGateTXT, AstroGateStoryboard]
+
+
+async def comfy_entrypoint():
+    register_routes()
+    return AstroGateExtension()
