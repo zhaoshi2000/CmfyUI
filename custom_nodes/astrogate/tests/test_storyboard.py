@@ -381,6 +381,16 @@ async def test_analysis_keeps_paragraph_when_ai_paraphrases_quote(modules, proje
     assert p["shots"][0]["source_refs"][0]["quote"] == "两人在客栈相遇"
 
 
+@pytest.mark.parametrize(('atmosphere','expected'), [(None, ''), ('雨后薄雾', '雨后薄雾'), (['细雨', '暖灯'], '细雨，暖灯')])
+def test_analysis_saves_optional_atmosphere_without_creating_image_assets(modules, project, atmosphere, expected):
+    paragraph = project['chapters'][0]['paragraphs'][1]['id']
+    draft = {'shots':[{'local_id':'new','summary':'客栈','source_refs':[{'paragraph_id':paragraph,'quote':None}],
+        'scene_id':'客栈','participants':[],'image_prompt':'客栈空镜','atmosphere':atmosphere}]}
+    modules.analysis.merge_shots(project,project['chapters'][0]['id'],draft,{paragraph},'analysis')
+    assert project['shots'][-1]['atmosphere']==expected
+    assert len(project['assets'])==5
+
+
 @pytest.mark.parametrize("outside_chapter", [False, True])
 def test_quote_fallback_does_not_accept_invalid_paragraphs(modules, project, outside_chapter):
     paragraph_id = project["chapters"][1]["paragraphs"][1]["id"] if outside_chapter else "invented"
@@ -537,6 +547,62 @@ def test_scene_views_enforce_empty_environments_without_removing_story_cast(modu
     assert '林夏' in frame and '周野' in frame
 
 
+def test_reference_purpose_does_not_mix_style_with_character_identity(modules, project):
+    native = sys.modules[modules.node.__name__ + '.storyboard.native']
+    character = native.prepare_native(modules.store, project, {'owner_id':'林夏','owner_type':'asset',
+        'prompt':'正视','settings':{},'view':'front'})
+    job = native.prepare_native(modules.store, project, {'owner_id':'shot1','owner_type':'shot',
+        'prompt':'两人在客栈相遇','settings':{},'references':[
+            {'slot':'reference_images.reference_1','job_id':character['id'],'role':'style','purpose':'只参考画风与色彩，不参考人物身份'},
+            {'slot':'reference_images.reference_2','job_id':character['id'],'role':'character','purpose':'林夏身份'},
+        ]})
+    style, identity = job['references']
+    assert style['role']=='style' and 'character_id' not in style and 'asset_view' not in style
+    assert identity['role']=='character' and identity['character_id']=='林夏' and identity['asset_view']=='front'
+    assert '图1：只参考画风与色彩' in job['prompt']
+    assert '图2：林夏身份' in job['prompt']
+    buffer = BytesIO()
+    Image.new('RGB',(8,8),'blue').save(buffer,format='PNG')
+    image = {'b64_json':modules.node.base64.b64encode(buffer.getvalue()).decode()}
+    packed, purposes = modules.node.pack_character_views([image,image],job['references'])
+    assert len(packed)==2 and [p['role'] for p in purposes]==['style','character']
+
+
+def test_editing_atmosphere_preserves_old_job_and_changes_only_the_shot(modules, project):
+    native = sys.modules[modules.node.__name__ + '.storyboard.native']
+    body = {'owner_id':'shot1','owner_type':'shot','prompt':'两人在客栈相遇','settings':{},'atmosphere':'窗外细雨'}
+    first = native.prepare_native(modules.store, project, body)
+    modules.store.update_job(first['id'], status='succeeded')
+    assert native.prepare_native(modules.store, modules.store.get(project['id']), body)['id']==first['id']
+    second = native.prepare_native(modules.store, modules.store.get(project['id']), {**body,'atmosphere':'夕阳与尘埃'})
+    assert second['id'] != first['id']
+    assert '窗外细雨' in modules.store.job(first['id'])['prompt']
+    assert '夕阳与尘埃' in second['prompt']
+    saved = modules.store.get(project['id'])
+    assert saved['shots'][0]['atmosphere']=='夕阳与尘埃'
+    assert len(saved['assets'])==len(project['assets'])
+
+
+async def test_global_style_changes_without_reanalysis_and_marks_frames_stale(modules, project, monkeypatch, aiohttp_client):
+    service = sys.modules[modules.node.__name__ + '.storyboard.service']
+    modules.store.change(project['id'],lambda p:p['shots'][0].update(stale=False))
+    routes = web.RouteTableDef()
+    monkeypatch.setattr(service,'get_store',lambda:modules.store)
+    monkeypatch.setattr(service,'PromptServer',SimpleNamespace(instance=SimpleNamespace(routes=routes,
+        user_manager=SimpleNamespace(get_request_user_id=lambda request:'default'))))
+    service.register_routes()
+    app=web.Application()
+    app.add_routes(routes)
+    client=await aiohttp_client(app)
+    response=await client.post('/astrogate/storyboard/projects/'+project['id']+'/edit',
+        json={'action':'frame_aspect_ratio','aspect_ratio':'16:9','style':'水彩绘本'})
+    assert response.status==200,await response.text()
+    saved=modules.store.get(project['id'])
+    assert saved['settings']['style']=='水彩绘本' and saved['shots'][0]['stale']
+    assert not modules.store.jobs(project['id'])
+    assert '画风：水彩绘本' in modules.graph.render_prompt(modules.graph.snapshot(saved,saved['shots'][0]),[])
+
+
 async def test_approving_character_views_preserves_locked_versions_and_reuses_the_pair(modules, project, monkeypatch, aiohttp_client):
     native = sys.modules[modules.node.__name__ + '.storyboard.native']
     service = sys.modules[modules.node.__name__ + '.storyboard.service']
@@ -682,7 +748,7 @@ async def test_native_frame_orders_actual_inputs_and_durably_reuses(modules, pro
         Image.new('RGB', (16, 9), 'blue').save(data, format='PNG')
         return {'data': [{'b64_json': m.base64.b64encode(data.getvalue()).decode()}]}
     monkeypatch.setattr(m, 'generate_image', generate)
-    job = native.prepare_native(modules.store, project, {'owner_id': 'shot1', 'owner_type': 'shot', 'prompt': '两人抬头',
+    job = native.prepare_native(modules.store, project, {'owner_id': 'shot1', 'owner_type': 'shot', 'prompt': '两人抬头', 'atmosphere': '窗外细雨与柔和暖光',
         'settings': {'resolution': '1K', 'quality': 'high', 'aspect_ratio': '16:9'},
         'references': [{'slot': 'reference_images.reference_1', 'purpose': '林夏身份'}, {'slot': 'reference_images.reference_2', 'purpose': '周野身份'}]})
     pending = m.AstroGateStoryboardFrame.check_lazy_status(job_id=job['id'], reference_images={'reference_1': (None, 'reference_images.reference_1')})
@@ -692,6 +758,12 @@ async def test_native_frame_orders_actual_inputs_and_durably_reuses(modules, pro
     output = await m.AstroGateStoryboardFrame.execute('两人抬头', job['id'], inputs, element_id='shot1')
     assert output.result[1]['element_id'] == 'shot1'
     assert sent[0]['prompt'].index('图1：林夏身份') < sent[0]['prompt'].index('图2：周野身份')
+    assert '本镜特效与氛围：窗外细雨与柔和暖光' in sent[0]['prompt']
+    assert modules.store.get(project['id'])['shots'][0]['atmosphere'] == '窗外细雨与柔和暖光'
+    saved_project = modules.store.get(project['id'])
+    recipe = native.native_canvas(modules.store, saved_project, saved_project['chapters'][0]['id'])
+    shot = next(n for n in recipe['nodes'] if n['id'] == 'shot1')
+    assert shot['properties']['astrogate_atmosphere'] == '窗外细雨与柔和暖光'
     saved = modules.store.job(job['id'])
     assert all(r['image']['hash'] for r in saved['references'])
     assert m.AstroGateStoryboardFrame.check_lazy_status(job_id=job['id'], reference_images={'reference_1': (None, 'reference_images.reference_1')}) == []

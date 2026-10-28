@@ -6,6 +6,9 @@ const states = {prepared: "等待参考图 / 排队中", queued: "排队中", ru
 const active = new Set(["prepared", "queued", "running", "analysing", "cancelling"]);
 const sceneOnly = "无人环境素材：只绘制建筑、空间、陈设与光照，不出现任何人物、路人、剪影或人物倒影。";
 const sceneAngles = {scene_left: "左侧机位", scene_right: "右侧机位", scene_reverse: "反打机位", scene_high: "高位俯视"};
+const kindLabels = {character: "人物", look: "人物造型", scene: "场景", scene_state: "场景状态", prop: "道具", shot: "分镜"};
+const referenceRoles = {auto: "自动", character: "人物身份", look: "人物造型", scene: "场景", prop: "道具", style: "画风参考", effect: "特效 / 氛围", previous: "前帧"};
+const referenceInstructions = {character: "仅参考这个人物的身份和体貌", look: "仅参考指定人物的服装、发型与配饰", scene: "仅参考环境布局与光照", prop: "仅参考指定道具的形状和细节", style: "仅参考整体画风，不把图中的主体画入", effect: "仅参考特效或氛围，不把图中的主体画入", previous: "仅参考上一帧中需要延续的空间与动作"};
 let activityPanel;
 const value = (node, name) => node.widgets?.find(w => w.name === name)?.value;
 const nodes = () => app.graph._nodes;
@@ -251,6 +254,16 @@ function imageSources(node) {
         .sort((a, b) => Number(a.name.split("_").at(-1)) - Number(b.name.split("_").at(-1)))
         .map(i => ({slot: i.name, node: sourceNode(node, i.name)}));
 }
+function referenceChoice(node, ref) {
+    const saved = node.properties.astrogate_reference_roles?.[ref.slot];
+    return saved && saved.source === String(ref.node.id) ? saved : {source: String(ref.node.id), role: "auto", detail: ""};
+}
+function referencePurpose(node, ref) {
+    const choice = referenceChoice(node, ref);
+    const automatic = ref.node.properties.astrogate_reference_purpose || `${ref.node.title}：参考画面与细节`;
+    const purpose = choice.role === "auto" ? automatic : `${ref.node.title}：${referenceInstructions[choice.role]}`;
+    return choice.detail ? `${purpose}；补充用途：${choice.detail}` : purpose;
+}
 function labelReferences(node) {
     for (const input of node.inputs || []) {
         if (!input.name.startsWith("reference_images.")) continue;
@@ -340,6 +353,7 @@ function mountGraph(board, recipe, relayout = false) {
                 upgrade.add(node);
             }
         }
+        if (item.properties.astrogate_kind === "shot" && node.properties.astrogate_atmosphere === undefined) node.properties.astrogate_atmosphere = item.properties.astrogate_atmosphere || "";
         node.properties.astrogate_chapter = recipe.chapter_id;
         node.agRefresh?.();
         restorePreview(node);
@@ -417,7 +431,8 @@ async function applyFrameAspect(board) {
     ratio = parts.join(":");
     setValue(board, "frame_aspect_ratio", ratio);
     const project = value(sourceNode(board, "script") || {}, "project_id") || board.properties.astrogate_board?.project_id;
-    if (project) await request(`/projects/${project}/edit`, {action: "frame_aspect_ratio", aspect_ratio: ratio});
+    const style = value(board, "style");
+    if (project) await request(`/projects/${project}/edit`, {action: "frame_aspect_ratio", aspect_ratio: ratio, ...(style === undefined ? {} : {style})});
     for (const node of nodes().filter(n => n.type === "AstroGateStoryboardFrame" && sourceNode(n, "board") === board && n.properties.astrogate_kind !== "character")) {
         setValue(node, "aspect_ratio", ratio);
         node.agRefresh?.();
@@ -445,7 +460,15 @@ async function queueNodes(targets, jobs = [], graph = null) {
 }
 function nodeSignature(node) {
     return JSON.stringify([value(node, "prompt"), value(node, "aspect_ratio"), value(node, "resolution"), value(node, "quality"),
-        imageSources(node).map(r => [r.slot, r.node.id, value(r.node, "job_id"), r.node.type === "AstroGateStoryboardFrame" ? null : r.node.widgets?.filter(w => w.options?.serialize !== false).map(w => w.value)]), sourceNode(node, "story_context")?.properties.astrogate_owner]);
+        imageSources(node).map(r => [r.slot, r.node.id, value(r.node, "job_id"), r.node.type === "AstroGateStoryboardFrame" ? null : r.node.widgets?.filter(w => w.options?.serialize !== false).map(w => w.value)]), sourceNode(node, "story_context")?.properties.astrogate_owner,
+        node.properties.astrogate_atmosphere || "", node.properties.astrogate_kind === "shot" ? value(sourceNode(node, "board") || {}, "style") || "" : "",
+        imageSources(node).map(r => { const choice = referenceChoice(node, r); return [choice.role, choice.detail || ""]; })]);
+}
+function upgradeSignature(node) {
+    const p = node.properties;
+    if (!p.astrogate_signature || p.astrogate_atmosphere || imageSources(node).some(r => { const c = referenceChoice(node, r); return c.role !== "auto" || c.detail; })) return;
+    const current = JSON.parse(nodeSignature(node));
+    if (p.astrogate_signature === JSON.stringify(current.slice(0, 6))) p.astrogate_signature = JSON.stringify(current);
 }
 function changed(node, seen = new Set()) {
     if (seen.has(node.id)) throw new Error("图片参考存在循环，请断开其中一条 IMAGE 连线。");
@@ -482,13 +505,13 @@ async function generate(targets, force = false, reporter = targets[0]) {
         if (previous && active.has(previous.status)) throw new Error(`${node.title} 已有任务，请等待或停止后再生成。`);
         for (const ref of imageSources(node)) if (ref.node.type === "AstroGateStoryboardFrame") await visit(ref.node, false);
         const refs = imageSources(node).map(ref => ({slot: ref.slot,
-            purpose: ref.node.properties.astrogate_reference_purpose || `${ref.node.title}：参考画面与细节`,
+            purpose: referencePurpose(node, ref), role: referenceChoice(node, ref).role,
             ...(ref.node.type === "AstroGateStoryboardFrame" ? {job_id: value(ref.node, "job_id")} : {source_signature: JSON.stringify(ref.node.widgets?.filter(w => w.options?.serialize !== false).map(w => w.value))}),
         }));
         message(node, `准备生成 · ${refs.length} 路图片参考`, true);
         const job = await request(`/projects/${project}/native/prepare`, {owner_id: node.properties.astrogate_owner,
             version_id: node.properties.astrogate_version, view: node.properties.astrogate_view,
-            owner_type: node.properties.astrogate_owner_type || "shot", prompt: value(node, "prompt"),
+            owner_type: node.properties.astrogate_owner_type || "shot", prompt: value(node, "prompt"), atmosphere: node.properties.astrogate_atmosphere || "",
             settings: {aspect_ratio: value(node, "aspect_ratio"), resolution: value(node, "resolution"), quality: value(node, "quality")},
             references: refs, story_parent_id: sourceNode(node, "story_context")?.properties.astrogate_owner || null, force: requested && force,
         });
@@ -703,10 +726,39 @@ function installFrame(node) {
     const referenceToggle = element("button", "", "ag-reference-toggle");
     referenceToggle.type = "button";
     referenceToggle.title = "展开后可查看、增删参考连线；收起保留所有连接";
+    const referenceList = element("div", undefined, "ag-reference-list");
     node.agRefreshReferences = () => {
         const folded = node.properties.astrogate_references_folded;
         const count = (node.inputs || []).filter(input => input.name.startsWith("reference_images.") && input.link != null).length;
-        referenceToggle.textContent = `${folded ? "▸" : "▾"} 参考图 ${count} · ${folded ? "展开连接" : "收起连接"}`;
+        referenceToggle.textContent = `${kindLabels[node.properties.astrogate_kind] || "图片"} · ${folded ? "▸" : "▾"} 参考图 ${count} · ${folded ? "展开连接" : "收起连接"}`;
+        referenceList.hidden = folded;
+        const refs = imageSources(node).filter(ref => ref.node);
+        referenceList.replaceChildren(...refs.map(ref => {
+            const row = element("div", undefined, "ag-reference-row");
+            const label = element("div", `参考 ${ref.slot.split("_").at(-1)} · ${ref.node.title || "图片"}`, "ag-reference-name");
+            const choice = referenceChoice(node, ref);
+            const role = element("select");
+            role.title = "指定这张参考图的用途";
+            for (const [id, name] of Object.entries(referenceRoles)) {
+                const option = element("option", name);
+                option.value = id;
+                role.append(option);
+            }
+            role.value = choice.role;
+            const detail = element("input");
+            detail.placeholder = "补充用途，如：林夏的脸型";
+            detail.value = choice.detail || "";
+            const update = () => {
+                const choices = node.properties.astrogate_reference_roles ||= {};
+                if (role.value === "auto" && !detail.value) delete choices[ref.slot];
+                else choices[ref.slot] = {source: String(ref.node.id), role: role.value, detail: detail.value};
+                app.graph.change();
+            };
+            role.addEventListener("change", update);
+            detail.addEventListener("input", update);
+            row.append(label, role, detail);
+            return row;
+        }));
         for (const input of node.inputs || []) {
             if (folded) input.pos = [10, 14]; else delete input.pos;
         }
@@ -756,6 +808,11 @@ function installFrame(node) {
     prompt.placeholder = "描述这一张图的主体、动作、景别和光线…";
     prompt.value = value(node, "prompt") || "";
     prompt.addEventListener("input", () => { setValue(node, "prompt", prompt.value); app.graph.change(); });
+    const atmosphereField = element("label", "特效 / 氛围", "ag-atmosphere");
+    const atmosphere = element("textarea");
+    atmosphere.placeholder = "可选，例如雨雾、烛光或魔法光效";
+    atmosphere.addEventListener("input", () => { node.properties.astrogate_atmosphere = atmosphere.value; app.graph.change(); });
+    atmosphereField.append(atmosphere);
     const parameters = element("div", undefined, "ag-parameters");
     const selects = [];
     for (const [name, label] of [["aspect_ratio", "画幅"], ["resolution", "分辨率"], ["quality", "质量"]]) {
@@ -770,7 +827,7 @@ function installFrame(node) {
         field.append(select);
         parameters.append(field);
     }
-    detail.append(summary, prompt, parameters);
+    detail.append(summary, prompt, atmosphereField, parameters);
     detail.addEventListener("toggle", () => {
         node.properties.astrogate_prompt_folded = !detail.open;
         resizeCard();
@@ -794,7 +851,7 @@ function installFrame(node) {
         content: label, callback: () => addSceneAngle(node, view).catch(error => message(node, error.message, false, true)),
     })), {event}));
     controls.append(addAngle);
-    content.append(referenceToggle, stage, controls, progressBar(node), detail, node.agStatus);
+    content.append(referenceToggle, referenceList, stage, controls, progressBar(node), detail, node.agStatus);
     node.agRefresh = () => {
         if (!node.properties.astrogate_compact_card) {
             node.properties.astrogate_prompt_folded = true;
@@ -803,6 +860,8 @@ function installFrame(node) {
         const scene = ["scene", "scene_state"].includes(node.properties.astrogate_kind);
         if (scene && !String(value(node, "prompt")).includes(sceneOnly)) setValue(node, "prompt", `${value(node, "prompt") || ""}\n${sceneOnly}`);
         prompt.value = value(node, "prompt") || "";
+        atmosphere.value = node.properties.astrogate_atmosphere || "";
+        atmosphereField.hidden = node.properties.astrogate_kind !== "shot";
         for (const [select, w] of selects) select.value = w.value;
         detail.open = !node.properties.astrogate_prompt_folded;
         const ratio = selects.find(([, w]) => w.name === "aspect_ratio")[0];
@@ -811,6 +870,7 @@ function installFrame(node) {
         approve.hidden = node.properties.astrogate_owner_type !== "asset" || node.properties.astrogate_view?.startsWith("scene_");
         addAngle.hidden = !scene || node.properties.astrogate_view?.startsWith("scene_");
         node.agRefreshReferences();
+        upgradeSignature(node);
         restorePreview(node);
     };
     node.size = [430, 400];

@@ -49,6 +49,8 @@ def semantic_hash(value):
 def render_prompt(snap, refs):
     lines = [snap["shot"]["image_prompt"], "画风：" + snap["settings"]["style"]]
     lines += snap["descriptions"] + snap["people"]
+    if snap["shot"].get("atmosphere"):
+        lines.append("本镜特效与氛围：" + snap["shot"]["atmosphere"])
     if refs:
         lines.append("参考图用途（按实际输入顺序）：")
         lines.extend(f"图{index + 1}：{ref['purpose']}" for index, ref in enumerate(refs))

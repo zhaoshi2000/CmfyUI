@@ -7,7 +7,7 @@ import { webcrypto } from "node:crypto";
 const source = await readFile(new URL("../web/storyboard.js", import.meta.url), "utf8");
 async function load(app, extras = {}, api = {}) {
     const context = vm.createContext({queueMicrotask, structuredClone, console, JSON, Set, Map, URLSearchParams, TextEncoder, crypto: webcrypto, ...extras});
-    const module = new vm.SourceTextModule(source + "\nexport { installFold, mountGraph, changed, generate, installFrame, analysisContext, startAnalysis, showAnalysisState, poll, panelWidget, activityStatus, activityLines, message, createActivityPanel, buildBoard, applyFrameAspect, batchProgress, addSceneAngle };", {context});
+    const module = new vm.SourceTextModule(source + "\nexport { installFold, mountGraph, changed, generate, installFrame, analysisContext, startAnalysis, showAnalysisState, poll, panelWidget, activityStatus, activityLines, message, createActivityPanel, buildBoard, applyFrameAspect, batchProgress, addSceneAngle, nodeSignature, upgradeSignature };", {context});
     await module.link(async specifier => {
         const name = specifier.includes("app.js") ? "app" : "api";
         return new vm.SyntheticModule([name], function () { this.setExport(name, name === "app" ? app : api); }, {context});
@@ -322,6 +322,7 @@ test('global aspect changes scene frames while keeping character designs and old
     assert.deepEqual(frames.map(n=>n.widgets.find(w=>w.name==='aspect_ratio').value),['2:3','2.39:1','2.39:1']);
     assert.ok(frames.every(n=>n.properties.astrogate_images[0].filename==='old.png'));
     assert.equal(JSON.parse(calls[0][1]).action,'frame_aspect_ratio');
+    assert.equal(JSON.parse(calls[0][1]).style,'电影光线，雨夜\n第二行');
 });
 
 test('image card controls precede a folded prompt and batch progress counts only saved images',async()=>{
@@ -329,6 +330,7 @@ test('image card controls precede a folded prompt and batch progress counts only
     class Element {
         constructor(tag){this.tag=tag;this.children=[];this.events={};this.classList={toggle(){}};elements.push(this);}
         append(...items){this.children.push(...items);}
+        replaceChildren(...items){this.children=items;}
         addEventListener(name,fn){this.events[name]=fn;}
         getAttribute(name){return this[name];}
         removeAttribute(name){delete this[name];}
@@ -346,8 +348,8 @@ test('image card controls precede a folded prompt and batch progress counts only
     installFrame(node);
     const root=elements.find(e=>e.className==='ag-native ag-image-card').children[0];
     const detail=elements.find(e=>e.tag==='details');
-    assert.equal(root.children[2].className,'ag-native-actions');
-    assert.equal(root.children[4],detail);
+    assert.equal(root.children[3].className,'ag-native-actions');
+    assert.equal(root.children[5],detail);
     assert.match(root.children[0].textContent,/参考图 2/);
     assert.equal(node.properties.astrogate_references_folded,true);
     assert.equal(node.agStatus.hidden,true);
@@ -376,6 +378,99 @@ test('image card controls precede a folded prompt and batch progress counts only
     assert.equal(node.agProgress.bar.value,1);assert.equal(node.agProgress.bar.max,4);
     assert.match(node.agProgress.label.textContent,/已完成 1\/4.*未完成\/异常 1/);
     node.onRemoved();assert.equal(disconnected,true);
+});
+
+test('legacy cards preserve cached images while style, atmosphere and reference purposes affect generation',async()=>{
+    const elements=[];
+    class Element {
+        constructor(tag){this.tag=tag;this.children=[];this.events={};this.classList={toggle(){}};elements.push(this);}
+        append(...items){this.children.push(...items);}
+        replaceChildren(...items){this.children=items;}
+        addEventListener(name,fn){this.events[name]=fn;}
+        getAttribute(name){return this[name];}
+        removeAttribute(name){delete this[name];}
+    }
+    class ResizeObserver {observe(){} disconnect(){}}
+    const {graph,LiteGraph,board}=analysisGraph();
+    const image=LiteGraph.createNode('LoadImage');graph.add(image);image.title='参考图';
+    const node=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(node);
+    node.title='第 1 镜';node.properties={astrogate_kind:'shot',astrogate_project:'project',astrogate_owner:'shot',astrogate_owner_type:'shot',astrogate_base_prompt:'两人交谈'};
+    Object.assign(node.widgets[0],{value:'两人交谈'});node.widgets[1].value='old-job';
+    node.widgets[3].value='16:9';node.widgets[4].value='4K';node.widgets[5].value='high';
+    node.properties.astrogate_base_settings=['16:9','4K','high'];
+    node.widgets.forEach(w=>{w.options={values:['16:9','4K','high']};});
+    node.addInput('reference_images.reference_1','IMAGE');image.connect(0,node,0);
+    node.addInput('board','ASTROGATE_BOARD');board.connect(0,node,1);
+    node.addDOMWidget=()=>({options:{}});node.setSize=size=>node.size=size;node.computeSize=()=>[430,440];
+    const calls=[];
+    const api={apiURL:path=>path,fetchApi:async(path,options)=>{
+        const body=options?.body ? JSON.parse(options.body) : null;
+        calls.push([path,body]);
+        const data=path.endsWith('/native/prepare')?{id:'new-job',status:'prepared'}:path.endsWith('/jobs/old-job')?{id:'old-job',status:'succeeded'}:{};
+        return {ok:true,json:async()=>data};
+    }};
+    const app={registerExtension(){},graph,nodeOutputs:{},graphToPrompt:async()=>({output:{},workflow:{}})};
+    const {installFrame,changed,generate,nodeSignature}=await load(app,{ResizeObserver,document:{createElement:tag=>new Element(tag)},FormData:class{},crypto:{randomUUID:()=> 'prompt-id'}},api);
+    node.properties.astrogate_signature=JSON.stringify(JSON.parse(nodeSignature(node)).slice(0,6));
+    installFrame(node);
+    assert.equal(changed(node),false);
+    assert.equal(JSON.parse(node.properties.astrogate_signature).length,9);
+    const style=board.widgets.find(w=>w.name==='style');
+    const originalStyle=style.value;
+    style.value='水墨风格';assert.equal(changed(node),true);
+    style.value=originalStyle;assert.equal(changed(node),false);
+    const root=elements.find(e=>e.className==='ag-native ag-image-card').children[0];
+    assert.match(root.children[0].textContent,/分镜.*参考图 1/);
+    root.children[0].events.click();
+    const row=root.children[1].children[0];
+    row.children[1].value='style';row.children[1].events.change();
+    row.children[2].value='仅参考中国水墨笔触';row.children[2].events.input();
+    const atmosphere=elements.find(e=>e.placeholder==='可选，例如雨雾、烛光或魔法光效');
+    atmosphere.value='窗外雨雾';atmosphere.events.input();
+    assert.equal(changed(node),true);
+    await generate([node]);
+    const prepared=calls.find(([path])=>path.endsWith('/native/prepare'))[1];
+    assert.equal(prepared.atmosphere,'窗外雨雾');
+    assert.equal(prepared.references[0].role,'style');
+    assert.match(prepared.references[0].purpose,/整体画风.*仅参考中国水墨笔触/);
+    assert.equal(calls.find(([path])=>path.endsWith('/edit'))[1].style,originalStyle);
+    assert.equal(changed(node),false);
+    const other=LiteGraph.createNode('LoadImage');graph.add(other);other.title='另一张参考图';other.connect(0,node,0);
+    assert.equal(changed(node),true);
+    await generate([node]);
+    const replaced=calls.filter(([path])=>path.endsWith('/native/prepare')).at(-1)[1].references[0];
+    assert.equal(replaced.role,'auto');
+    assert.doesNotMatch(replaced.purpose,/中国水墨笔触/);
+});
+
+test('legacy signature migration does not hide edits or reference changes',async()=>{
+    const {graph,LiteGraph}=graphMock();
+    const node=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(node);
+    node.properties={astrogate_kind:'shot',astrogate_base_prompt:'原提示词'};
+    node.widgets[0].value='原提示词';
+    const {changed,nodeSignature,upgradeSignature}=await load({registerExtension(){},graph});
+    node.properties.astrogate_signature=JSON.stringify(JSON.parse(nodeSignature(node)).slice(0,6));
+    const previous=node.properties.astrogate_signature;
+    node.widgets[0].value='修改后的提示词';
+    upgradeSignature(node);
+    assert.equal(node.properties.astrogate_signature,previous);
+    assert.equal(changed(node),true);
+});
+
+test('changing global style marks shots changed but keeps completed assets reusable',async()=>{
+    const {graph,LiteGraph,board}=analysisGraph();
+    const asset=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(asset);
+    asset.properties={astrogate_kind:'character',astrogate_base_prompt:'人物'};
+    asset.widgets[0].value='人物';asset.addInput('board','ASTROGATE_BOARD');board.connect(0,asset,0);
+    const shot=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(shot);
+    shot.properties={astrogate_kind:'shot',astrogate_base_prompt:'分镜'};
+    shot.widgets[0].value='分镜';shot.addInput('board','ASTROGATE_BOARD');board.connect(0,shot,0);
+    const {changed,nodeSignature}=await load({registerExtension(){},graph});
+    asset.properties.astrogate_signature=nodeSignature(asset);
+    shot.properties.astrogate_signature=nodeSignature(shot);
+    board.widgets.find(w=>w.name==='style').value='水墨风格';
+    assert.equal(changed(asset),false);
+    assert.equal(changed(shot),true);
 });
 
 test('extra scene angles are manual independent nodes referencing one base scene',async()=>{

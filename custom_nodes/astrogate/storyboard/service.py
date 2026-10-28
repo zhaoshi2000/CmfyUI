@@ -111,8 +111,12 @@ def register_routes():
             action = body["action"]
             if action == "frame_aspect_ratio":
                 ratio = aspect_ratio(body["aspect_ratio"])
-                if p["settings"]["aspect_ratio"] != ratio:
+                style = body.get("style", p["settings"]["style"])
+                if not isinstance(style, str):
+                    raise ValueError("画风设定须为文字。")
+                if p["settings"]["aspect_ratio"] != ratio or p["settings"]["style"] != style:
                     p["settings"]["aspect_ratio"] = ratio
+                    p["settings"]["style"] = style
                     invalidate(p, [s["id"] for s in p["shots"]])
             elif action == "settings":
                 values = body["settings"]

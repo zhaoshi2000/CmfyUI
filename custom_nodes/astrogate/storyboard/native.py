@@ -91,6 +91,8 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
                  "astrogate_kind": kind, "astrogate_key": key, "astrogate_base_prompt": prompt, "astrogate_prompt_folded": True,
                  "astrogate_view": view, "astrogate_layout_version": 2,
                  "astrogate_images": [job["saved_result"]] if job and job.get("saved_result") else []}
+        if kind == "shot":
+            props["astrogate_atmosphere"] = owner.get("atmosphere", "")
         parent = asset_by_id(project, owner.get("parent_id"))
         purpose = {"character": "人物身份、脸型体貌，不套用服装", "look": "此人物的服装、发型和配饰",
                    "scene": "场景空间布局，不自动带入参考图中的人物", "scene_state": "场景时段、天气与光线",
@@ -206,6 +208,11 @@ def prepare_native(store, project, body):
     if view not in views:
         raise ValueError("素材视图无效。")
     shot["image_prompt"] = body["prompt"]
+    if kind == "shot":
+        atmosphere = body.get("atmosphere", shot.get("atmosphere", ""))
+        if not isinstance(atmosphere, str):
+            raise ValueError("特效与氛围须为文字。")
+        shot["atmosphere"] = atmosphere.strip()
     if kind == "asset" and not view:
         shot["asset_description"] = body["prompt"]
     settings = {**project["settings"], **body["settings"]}
@@ -215,6 +222,11 @@ def prepare_native(store, project, body):
     refs = []
     for item in body.get("references", []):
         ref = {"purpose": str(item.get("purpose") or "参考构图与细节"), "slot": item["slot"]}
+        role = item.get("role") or "auto"
+        if role not in ("auto", "character", "look", "scene", "prop", "style", "effect", "previous"):
+            raise ValueError("参考图用途无效。")
+        if role != "auto":
+            ref["role"] = role
         if item.get("source_signature"):
             ref["source_signature"] = str(item["source_signature"])
         if item.get("job_id"):
@@ -224,11 +236,12 @@ def prepare_native(store, project, body):
             ref["job_id"] = source["id"]
             ref["asset_id"] = source["owner_id"]
             source_asset = asset_by_id(project, source["owner_id"]) if source["owner_type"] == "asset" else None
-            if source_asset:
+            same_role = source_asset and (role in ("auto", source_asset["kind"]) or role == "scene" and source_asset["kind"] == "scene_state")
+            if same_role:
                 ref["asset_kind"] = source_asset["kind"]
                 if source_asset["kind"] in ("character", "look"):
                     ref["character_id"] = source_asset["parent_id"] if source_asset["kind"] == "look" else source_asset["id"]
-            if source.get("asset_view"):
+            if same_role and source.get("asset_view"):
                 ref.update(asset_view=source["asset_view"], version_id=source["asset_version_id"])
         refs.append(ref)
     story_id = body.get("story_parent_id")
@@ -239,7 +252,7 @@ def prepare_native(store, project, body):
     snap.update(settings=settings, story_parent_id=story_id, story_summary=story["summary"] if story else "")
     if story:
         snap["descriptions"].append(f"前情（只延续叙事，不自动画入前镜人物）：{story['summary']}")
-    fingerprint = digest([shot["image_prompt"], settings, refs, story_id, snap["story_summary"], snap["descriptions"], snap["people"], view, shot.get("asset_kind")])
+    fingerprint = digest([shot["image_prompt"], settings, refs, story_id, snap["story_summary"], snap["descriptions"], snap["people"], view, shot.get("asset_kind"), shot.get("atmosphere", "")])
     asset_version = asset["current_version_id"] if kind == "asset" else None
     jobs = [j for j in store.jobs(project["id"]) if j.get("owner_id") == owner_id and j.get("native") and j.get("asset_version_id") == asset_version
             and j.get("asset_view", "front" if view else "") == view]
@@ -254,8 +267,9 @@ def prepare_native(store, project, body):
     if kind == "shot":
         def edited(p):
             current = next(s for s in p["shots"] if s["id"] == owner_id)
-            if current["image_prompt"] != body["prompt"]:
+            if current["image_prompt"] != body["prompt"] or current.get("atmosphere", "") != shot.get("atmosphere", ""):
                 current["image_prompt"] = body["prompt"]
+                current["atmosphere"] = shot["atmosphere"]
                 current["revision"] += 1
                 invalidate(p, [owner_id])
         store.change(project["id"], edited)
