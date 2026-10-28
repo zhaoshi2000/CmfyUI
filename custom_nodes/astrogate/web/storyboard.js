@@ -487,8 +487,30 @@ async function generate(targets, force = false, reporter = targets[0]) {
     if (!targets.length) throw new Error("请先选中分镜图片卡片。");
     if (submitting) throw new Error("正在准备本次请求，请稍候。");
     submitting = true;
-    const prepared = [], visited = new Set(), visiting = new Set();
+    const prepared = [], visited = new Set(), visiting = new Set(), checks = new Map();
     let submitted = false;
+    async function inspect(node, requested) {
+        if (checks.has(node.id)) return checks.get(node.id);
+        if (visiting.has(node.id)) throw new Error("图片参考存在循环，请断开其中一条 IMAGE 连线。");
+        visiting.add(node.id);
+        const jobId = value(node, "job_id");
+        const previous = jobId ? await request(`/jobs/${jobId}`) : null;
+        let issue = null;
+        if (previous && active.has(previous.status)) {
+            issue = {source: node, jobId, reason: "已有任务正在进行，请等待结束后再生成。"};
+        } else if (previous?.status === "unknown" && !(requested && force && targets.length === 1)) {
+            issue = {source: node, jobId, reason: "上次结果未知；请先确认结果，或在此卡片点击“重绘”。"};
+        } else if (!(previous?.status === "succeeded" && !changed(node) && !(requested && force))) {
+            for (const ref of imageSources(node)) {
+                if (ref.node.type !== "AstroGateStoryboardFrame") continue;
+                issue = await inspect(ref.node, false);
+                if (issue) break;
+            }
+        }
+        visiting.delete(node.id);
+        checks.set(node.id, issue);
+        return issue;
+    }
     async function visit(node, requested) {
         if (visited.has(node.id)) return;
         if (visiting.has(node.id)) throw new Error("图片参考存在循环，请断开其中一条 IMAGE 连线。");
@@ -526,12 +548,26 @@ async function generate(targets, force = false, reporter = targets[0]) {
     }
     try {
         for (const board of new Set(targets.map(n => sourceNode(n, "board")).filter(Boolean))) await applyFrameAspect(board);
-        for (const node of targets) await visit(node, true);
+        const ready = [];
+        for (const node of targets) {
+            const issue = await inspect(node, true);
+            if (!issue) { delete node.agSkipped; ready.push(node); continue; }
+            const reason = node === issue.source ? issue.reason : `本次未生成：参考「${issue.source.title || "图片"}」${issue.reason}`;
+            node.agSkipped = {sourceId: issue.source.id, jobId: issue.jobId, reason};
+            message(node, reason, false, true);
+            if (node !== issue.source) message(issue.source, issue.reason, false, true);
+        }
+        if (!ready.length) {
+            if (!targets.includes(reporter)) message(reporter, `本次没有可执行的图片，${targets.length} 张等待确认或上游任务。`, false, true);
+            return;
+        }
+        for (const node of ready) await visit(node, true);
         const count = prepared.filter(j => j.status !== "succeeded").length;
-        message(reporter, `本次 ${count} 张新图 · ${Math.max(0, visited.size - count)} 张复用 · 按 IMAGE 连线执行`, true);
+        const batchReporter = targets.includes(reporter) && !ready.includes(reporter) ? ready[0] : reporter;
+        message(batchReporter, `本次 ${count} 张新图 · ${Math.max(0, visited.size - count)} 张复用${targets.length > ready.length ? ` · ${targets.length - ready.length} 张等待确认或上游` : ""} · 按 IMAGE 连线执行`, true);
         const graph = await app.graphToPrompt();
         submitted = true;
-        await queueNodes(targets, prepared, graph);
+        await queueNodes(ready, prepared, graph);
         const batch = [...visited].map(id => value(app.graph.getNodeById(id), "job_id")).filter(Boolean);
         for (const board of new Set([reporter, ...targets.map(n => sourceNode(n, "board"))].filter(n => n?.type === "AstroGateStoryboard"))) board.properties.astrogate_generation_jobs = batch;
         for (const board of nodes().filter(n => n.type === "AstroGateStoryboard" && n.properties.astrogate_board)) await saveBoard(board);
@@ -840,6 +876,39 @@ function installFrame(node) {
             const id = value(node, "job_id");
             if (id) await request(`/jobs/${id}/cancel`, {});
         }));
+    const recover = button(node, "查询并取回", async () => {
+        const jobId = value(node, "job_id");
+        if (!jobId) throw new Error("没有可查询的图片任务。");
+        message(node, "正在查询服务端结果，不会重复生成。", true);
+        let result;
+        try { result = await request(`/jobs/${jobId}/recover`, {}); }
+        catch (error) {
+            node.agRecovery = {jobId, status: "error", reason: `结果查询失败：${error.message}`};
+            throw error;
+        }
+        if (result.status === "succeeded" && result.saved_result?.filename) {
+            delete node.agRecovery;
+            delete node.agSkipped;
+            node.properties.astrogate_images = [result.saved_result];
+            restorePreview(node);
+            recover.hidden = true;
+            showProgress(node, "已取回并保存图片", 1);
+            message(node, "已取回并保存图片。");
+            app.graph.change();
+            return;
+        }
+        const reasons = {pending: "服务端尚未确认结果，稍后可再次查询；不会重复提交。",
+            missing: "服务端未找到结果，请检查记录；确认后可点“重绘”。",
+            expired: "服务端结果已过期，请检查记录；确认后可点“重绘”。",
+            unavailable: "结果查询服务暂不可用，请稍后再查询，不会重复提交。"};
+        const reason = reasons[result.status] || "服务端尚未确认结果，请检查记录后再操作。";
+        node.agRecovery = {jobId, status: result.status, reason};
+        showProgress(node, reason, 0);
+        message(node, reason, false, result.status !== "pending");
+    });
+    recover.hidden = true;
+    node.agRecoverButton = recover;
+    controls.append(recover);
     const approve = button(node, "设为定稿素材", async () => {
         await request(`/projects/${node.properties.astrogate_project}/edit`, {action: "approve", job_id: value(node, "job_id")});
         message(node, "素材已定稿，其他章节可以复用。");
@@ -890,8 +959,19 @@ async function poll() {
                 const job = jobs.get(value(node, "job_id"));
                 if (!job) continue;
                 activityEntries.push({node, job});
-                message(node, (states[job.status] || job.status) + (job.error ? ` · ${job.error}` : ""), active.has(job.status), ["failed", "unknown", "blocked"].includes(job.status));
-                showProgress(node, states[job.status] || job.status, job.status === "succeeded" ? 1 : active.has(job.status) ? null : 0);
+                const skipped = node.agSkipped;
+                const source = skipped && app.graph.getNodeById(skipped.sourceId);
+                const sourceJob = source && jobs.get(value(source, "job_id"));
+                const recovery = node.agRecovery?.jobId === job.id && job.status === "unknown" ? node.agRecovery : null;
+                if (node.agRecoverButton) node.agRecoverButton.hidden = job.status !== "unknown";
+                if (recovery) message(node, recovery.reason, false, recovery.status !== "pending");
+                else if (sourceJob && sourceJob.id === skipped?.jobId && (sourceJob.status === "unknown" || active.has(sourceJob.status))) message(node, skipped.reason, false, true);
+                else {
+                    delete node.agSkipped;
+                    delete node.agRecovery;
+                    message(node, (states[job.status] || job.status) + (job.error ? ` · ${job.error}` : ""), active.has(job.status), ["failed", "unknown", "blocked"].includes(job.status));
+                }
+                showProgress(node, recovery?.reason || states[job.status] || job.status, job.status === "succeeded" ? 1 : active.has(job.status) ? null : 0);
                 if (job.saved_result) { node.properties.astrogate_images = [job.saved_result]; restorePreview(node); }
             }
             for (const node of boards.filter(n => value(sourceNode(n, "script") || {}, "project_id") === project)) {

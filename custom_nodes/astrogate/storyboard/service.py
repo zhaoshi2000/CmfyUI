@@ -26,23 +26,33 @@ def get_store():
     return _store
 
 
-def queue_failure(job, history):
+def queue_failure(job, history, jobs=None):
     messages = history.get("status", {}).get("messages", [])
+    if any(event == "execution_interrupted" for event, _ in messages):
+        return "cancelled", "此批次已停止，图片请求尚未发出。"
+    for ref in job.get("references", []):
+        upstream = (jobs or {}).get(ref.get("job_id"))
+        if upstream and upstream["status"] in ("failed", "unknown", "cancelled", "blocked"):
+            purpose = ref.get("purpose", "上游参考图")[:120]
+            reason = {"failed": "失败", "unknown": "结果未知", "cancelled": "已取消", "blocked": "上游未完成"}[upstream["status"]]
+            return "blocked", f"参考图“{purpose}”{reason}；此图片尚未执行。"
     for event, details in reversed(messages):
         if event == "execution_error":
             node_id = str(details["node_id"])
             node = history["prompt"][2].get(node_id, {})
             title = node.get("_meta", {}).get("title") or f"节点 {node_id}"
             reason = details.get("exception_message", "执行失败").strip()[:400]
+            if details.get("exception_type") == "ExecutionBlocked":
+                if node.get("inputs", {}).get("job_id") == job["id"]:
+                    return "blocked", f"{title}的参考图未成功；此图片尚未执行。"
+                continue
             if node.get("inputs", {}).get("job_id") == job["id"]:
                 return "failed", f"{title}：{reason}。图片请求尚未发出。"
             return "blocked", f"本批次被“{title}”报错中止：{reason}。此图片尚未执行。"
-        if event == "execution_interrupted":
-            return "cancelled", "此批次已停止，图片请求尚未发出。"
     return "blocked", "队列已结束，此图片尚未执行。请检查参考图是否已生成。"
 
 
-def register_routes():
+def register_routes(recover_image=None):
     server = PromptServer.instance
     store = get_store()
     tasks = {}
@@ -91,9 +101,11 @@ def register_routes():
     async def get_project(request):
         project = project_for(request)
         history = server.prompt_queue.get_history()
-        for job in store.jobs(project["id"]):
+        all_jobs = store.jobs(project["id"])
+        by_id = {job["id"]: job for job in all_jobs}
+        for job in all_jobs:
             if job["status"] in ("prepared", "blocked") and job.get("prompt_id") in history:
-                status, error = queue_failure(job, history[job["prompt_id"]])
+                status, error = queue_failure(job, history[job["prompt_id"]], by_id)
                 if (status, error) != (job["status"], job.get("error")):
                     store.update_job(job["id"], status=status, error=error)
         jobs = [{k: v for k, v in j.items() if k not in ("snapshot", "responses", "prompt", "references")}
@@ -259,6 +271,15 @@ def register_routes():
     @route("GET", "/jobs/{job}")
     async def get_job(request):
         return web.json_response(job_for(request))
+
+    @route("POST", "/jobs/{job}/recover")
+    async def recover(request):
+        job = job_for(request)
+        if job["kind"] != "image" or job["status"] != "unknown":
+            raise ValueError("只有结果未知的图片任务可以查询取回。")
+        if recover_image is None:
+            raise ValueError("当前图片服务不支持查询并取回。")
+        return web.json_response(await recover_image(store, job))
 
     @route("POST", "/jobs/{job}/resume")
     async def resume_analysis(request):

@@ -3,6 +3,7 @@ import base64
 import binascii
 import json
 import os
+import re
 import secrets
 import hashlib
 import math
@@ -17,6 +18,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 import folder_paths
 from comfy_api.latest import ComfyExtension, io, ui
+from comfy_execution.graph_utils import ExecutionBlocker
 from server import PromptServer
 
 from .storyboard.graph import render_prompt, semantic_hash, snapshot
@@ -190,10 +192,20 @@ def reference_sheet(images):
     return {"b64_json": base64.b64encode(buffer.getvalue()).decode(), "filename": "reference-atlas.png", "mime_type": "image/png"}
 
 
+def image_timeout():
+    try:
+        seconds = float(os.environ.get("ASTROGATE_IMG_TIMEOUT", "900"))
+    except ValueError:
+        raise ValueError("ASTROGATE_IMG_TIMEOUT 必须是正数秒。") from None
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("ASTROGATE_IMG_TIMEOUT 必须是正数秒。")
+    return aiohttp.ClientTimeout(total=seconds, connect=15)
+
+
 async def generate_image(payload, edit):
     key = read_api_key()
     operation = "edits" if edit else "generations"
-    timeout = aiohttp.ClientTimeout(total=300, connect=15)
+    timeout = image_timeout()
     try:
         async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
             async with session.post(f"{API_BASE}/images/{operation}", json=payload,
@@ -236,6 +248,67 @@ def decode_image(response, target=None):
         return torch.from_numpy(array).unsqueeze(0)
     except (ValueError, binascii.Error, OSError, Image.DecompressionBombError):
         raise RuntimeError("AstroGate 返回的图片无法读取或超过大小限制。") from None
+
+
+def save_storyboard_image(store, job, saved, expected_status=None):
+    output_file = Path(folder_paths.get_output_directory()) / saved.subfolder / saved.filename
+    stored_image = store.save_image(job["project_id"], output_file.read_bytes())
+    store.update_job(job["id"], expected_status=expected_status, status="succeeded", result_image=stored_image,
+                     saved_result=dict(saved), error=None)
+
+    def completed(project):
+        if job["owner_type"] != "shot":
+            return
+        shot = next((s for s in project["shots"] if s["id"] == job["owner_id"]), None)
+        if shot:
+            invalidate(project, [s["id"] for s in project["shots"] if s.get("previous_shot_id") == shot["id"]])
+            shot["latest_job_id"] = job["id"]
+            shot["stale"] = (shot["image_prompt"] != job["snapshot"]["shot"]["image_prompt"] or
+                             shot.get("atmosphere", "") != job["snapshot"]["shot"].get("atmosphere", "")) if job.get("native") else semantic_hash(snapshot(project, shot)) != job["fingerprint"]
+            for ref in job.get("references", []):
+                if ref.get("previous_shot_id"):
+                    previous = next(s for s in project["shots"] if s["id"] == ref["previous_shot_id"])
+                    if previous.get("latest_job_id") != ref["job_id"] or previous.get("stale"):
+                        shot["stale"] = True
+    store.change(job["project_id"], completed)
+
+
+async def recover_storyboard_image(store, job):
+    request_id = job.get("gateway_request_id", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", request_id):
+        raise ValueError("此任务没有可查询的图片请求编号。")
+    try:
+        key = read_api_key()
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60, connect=15), trust_env=False) as session:
+            async with session.get(f"{API_BASE}/images/jobs/{request_id}", headers={"Authorization": f"Bearer {key}"}, allow_redirects=False) as response:
+                if response.status != 200:
+                    raise ValueError(f"图片服务暂不可查询结果（HTTP {response.status}），未重新生成。")
+                raw = bytearray()
+                async for chunk in response.content.iter_chunked(1024 * 1024):
+                    raw.extend(chunk)
+                    if len(raw) > 48 * 1024 * 1024:
+                        raise ValueError("图片查询结果过大，未重新生成。")
+        result = json.loads(raw)
+        if not isinstance(result, dict):
+            raise ValueError("图片服务返回了无效查询结果，未重新生成。")
+        status = result.get("status")
+        if status in ("pending", "missing", "expired", "unavailable"):
+            return {"status": status}
+        if status != "succeeded":
+            return {"status": "unavailable"}
+        latest = store.job(job["id"])
+        if latest["status"] == "succeeded":
+            return {"status": "succeeded", "saved_result": latest["saved_result"]}
+        if latest["status"] != "unknown":
+            raise ValueError("任务状态已变化，请刷新后查看。")
+        settings = job["settings"]
+        target = output_dimensions(settings["aspect_ratio"], settings["resolution"]) if settings["resolution"] != "original" else None
+        image = decode_image(result.get("result"), target)
+        saved = ui.ImageSaveHelper.save_images(image, f"AstroGate/{job['project_id']}/{job['id']}", io.FolderType.output, None)[0]
+        save_storyboard_image(store, job, saved, expected_status=("unknown",))
+        return {"status": "succeeded", "saved_result": dict(saved)}
+    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, RuntimeError) as error:
+        raise ValueError("查询图片结果失败，请稍后再试；未重新生成。") from error
 
 
 class AstroGateImage(io.ComfyNode):
@@ -345,9 +418,22 @@ class AstroGateStoryboardFrame(io.ComfyNode):
     @classmethod
     async def execute(cls, prompt, job_id, reference_images=None, element_id="", aspect_ratio=None, resolution=None, quality=None, board=None, story_context=None):
         if not job_id:
-            return io.NodeOutput(block_execution="图片尚未生成，请点击卡片上的“生成图像”。")
+            return io.NodeOutput(ExecutionBlocker("图片尚未生成，请点击卡片上的“生成图像”。"), None)
         async with frame_queue.slot():
-            return await cls._execute_frame(prompt, job_id, reference_images, element_id, aspect_ratio, resolution, quality, board, story_context)
+            try:
+                return await cls._execute_frame(prompt, job_id, reference_images, element_id, aspect_ratio, resolution, quality, board, story_context)
+            except (RuntimeError, ValueError, OSError) as error:
+                store = get_store()
+                job = store.job(job_id)
+                if not job.get("native"):
+                    raise
+                if job["status"] in ("prepared", "queued"):
+                    store.update_job(job_id, expected_status=("prepared", "queued"), status="failed", error=str(error))
+                elif job["status"] == "succeeded" and isinstance(error, OSError):
+                    store.update_job(job_id, expected_status=("succeeded",), status="unknown",
+                                     error="本地保存的图片无法读取，可尝试查询并取回；未重新生成。")
+                story = {"project_id": job["project_id"], "element_id": job["owner_id"], "summary": job["snapshot"]["shot"].get("summary", "")}
+                return io.NodeOutput(ExecutionBlocker("上游参考图未成功，请检查对应卡片；不会自动重试。"), story)
 
     @classmethod
     async def _execute_frame(cls, prompt, job_id, reference_images=None, element_id="", aspect_ratio=None, resolution=None, quality=None, board=None, story_context=None):
@@ -428,6 +514,7 @@ class AstroGateStoryboardFrame(io.ComfyNode):
         if job.get("native"):
             payload["prompt"] = render_prompt(job["snapshot"], request_refs)
         read_api_key()
+        image_timeout()
         request_path = store.root / "requests" / f"{job['id']}.json"
         request_path.parent.mkdir(exist_ok=True)
         serialized = json.dumps(payload, ensure_ascii=False).encode()
@@ -441,31 +528,15 @@ class AstroGateStoryboardFrame(io.ComfyNode):
             response = await generate_image(payload, bool(references))
             image = decode_image(response, (width, height) if settings["resolution"] != "original" else None)
             saved = ui.ImageSaveHelper.save_images(image, f"AstroGate/{job['project_id']}/{job['id']}", io.FolderType.output, cls)[0]
-            output_file = Path(folder_paths.get_output_directory()) / saved.subfolder / saved.filename
-            stored_image = store.save_image(job["project_id"], output_file.read_bytes())
-            store.update_job(job_id, status="succeeded", result_image=stored_image, saved_result=dict(saved))
-
-            def completed(project):
-                if job["owner_type"] != "shot":
-                    return
-                shot = next((s for s in project["shots"] if s["id"] == job["owner_id"]), None)
-                if shot:
-                    invalidate(project, [s["id"] for s in project["shots"] if s.get("previous_shot_id") == shot["id"]])
-                    shot["latest_job_id"] = job_id
-                    shot["stale"] = (shot["image_prompt"] != job["snapshot"]["shot"]["image_prompt"]) if job.get("native") else semantic_hash(snapshot(project, shot)) != job["fingerprint"]
-                    for ref in expected:
-                        if ref.get("previous_shot_id"):
-                            previous = next(s for s in project["shots"] if s["id"] == ref["previous_shot_id"])
-                            if previous.get("latest_job_id") != ref["job_id"] or previous.get("stale"):
-                                shot["stale"] = True
-            store.change(job["project_id"], completed)
+            save_storyboard_image(store, {**job, "references": expected}, saved)
             if node_id:
                 PromptServer.instance.send_progress_text("已保存分镜帧", node_id)
             return io.NodeOutput(image, story_output, ui=ui.SavedImages([saved]))
-        except (RuntimeError, ValueError, OSError, asyncio.CancelledError):
+        except (RuntimeError, ValueError, OSError, asyncio.CancelledError) as error:
             # A failed response cannot prove that the provider did not generate/bill the image.
             if store.job(job_id)["status"] != "succeeded":
-                store.update_job(job_id, status="unknown", error="请求已发出，结果未确认；未自动重试。")
+                reason = str(error) or "本地任务已停止"
+                store.update_job(job_id, status="unknown", error=f"请求已发出，结果未确认：{reason}；未自动重试。")
             if node_id:
                 PromptServer.instance.send_progress_text("结果未确认，请查看任务记录", node_id)
             raise
@@ -523,5 +594,5 @@ class AstroGateExtension(ComfyExtension):
 
 
 async def comfy_entrypoint():
-    register_routes()
+    register_routes(recover_storyboard_image)
     return AstroGateExtension()

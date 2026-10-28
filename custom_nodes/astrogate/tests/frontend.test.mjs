@@ -100,6 +100,143 @@ test("story edges never prepare or regenerate the preceding image", async () => 
     assert.deepEqual(queued.partial_execution_targets, [String(target.id)]);
 });
 
+test('batch skips unknown and running branches but still queues independent targets',async()=>{
+    const {graph,LiteGraph}=graphMock();
+    const make=(name,job='')=>{
+        const node=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(node);
+        node.title=name;node.widgets[0].value=name;node.widgets[1].value=job;
+        node.properties={astrogate_project:'p',astrogate_owner:name,astrogate_owner_type:'shot',astrogate_base_prompt:name};
+        node.agStatus={textContent:'',classList:{toggle(){}}};return node;
+    };
+    const unknown=make('未知人物','unknown-job'), running=make('生成中的场景','running-job');
+    const blocked=make('依赖未知人物'), busy=make('依赖场景'), independent=make('独立镜头');
+    blocked.addInput('reference_images.reference_1','IMAGE');unknown.connect(0,blocked,0);
+    busy.addInput('reference_images.reference_1','IMAGE');running.connect(0,busy,0);
+    const calls=[];
+    const api={fetchApi:async(path,options)=>{
+        const body=options?.body?JSON.parse(options.body):null;calls.push([path,body]);
+        const result=path.endsWith('/jobs/unknown-job')?{id:'unknown-job',status:'unknown'}:
+            path.endsWith('/jobs/running-job')?{id:'running-job',status:'running'}:
+            path.endsWith('/native/prepare')?{id:'independent-job',status:'prepared'}:{};
+        return {ok:true,json:async()=>result};
+    }};
+    const app={registerExtension(){},graph,nodeOutputs:{},graphToPrompt:async()=>({output:{},workflow:{}})};
+    const {generate}=await load(app,{LiteGraph,FormData:class{},crypto:{randomUUID:()=> 'batch-id'}},api);
+    await generate([blocked,busy,independent]);
+    assert.match(blocked.agStatus.textContent,/未知人物.*结果未知.*重绘/);
+    assert.match(busy.agStatus.textContent,/生成中的场景.*任务正在进行/);
+    assert.deepEqual(calls.filter(([path])=>path.endsWith('/native/prepare')).map(([,body])=>body.owner_id),['独立镜头']);
+    assert.deepEqual(calls.find(([path])=>path==='/prompt')[1].partial_execution_targets,[String(independent.id)]);
+    assert.equal(unknown.widgets[1].value,'unknown-job');
+    assert.equal(running.widgets[1].value,'running-job');
+});
+
+test('all blocked targets do not submit work and only explicit single redraw retries an unknown result',async()=>{
+    const {graph,LiteGraph}=graphMock();
+    const source=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(source);
+    source.title='未知人物';source.widgets[0].value='人物';source.widgets[1].value='unknown-job';
+    source.properties={astrogate_project:'p',astrogate_owner:'actor',astrogate_owner_type:'asset',astrogate_base_prompt:'人物'};
+    source.agStatus={textContent:'',classList:{toggle(){}}};
+    const target=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(target);
+    target.title='分镜';target.widgets[0].value='分镜';
+    target.properties={astrogate_project:'p',astrogate_owner:'shot',astrogate_owner_type:'shot',astrogate_base_prompt:'分镜'};
+    target.agStatus={textContent:'',classList:{toggle(){}}};
+    target.addInput('reference_images.reference_1','IMAGE');source.connect(0,target,0);
+    const calls=[];
+    const api={fetchApi:async(path,options)=>{
+        const body=options?.body?JSON.parse(options.body):null;calls.push([path,body]);
+        const result=path.endsWith('/jobs/unknown-job')?{id:'unknown-job',status:'unknown'}:
+            path.endsWith('/native/prepare')?{id:'redrawn',status:'prepared'}:{};
+        return {ok:true,json:async()=>result};
+    }};
+    const app={registerExtension(){},graph,nodeOutputs:{},graphToPrompt:async()=>({output:{},workflow:{}})};
+    const {generate}=await load(app,{LiteGraph,FormData:class{},crypto:{randomUUID:()=> 'batch-id'}},api);
+    await generate([source,target],true);
+    assert.match(source.agStatus.textContent,/结果未知.*重绘/);
+    assert.match(target.agStatus.textContent,/未知人物.*结果未知/);
+    assert.equal(calls.some(([path])=>path==='/prompt'||path.endsWith('/native/prepare')),false);
+    await generate([source],true);
+    const body=calls.find(([path])=>path.endsWith('/native/prepare'))[1];
+    assert.equal(body.owner_id,'actor');assert.equal(body.force,true);
+    assert.equal(calls.filter(([path])=>path==='/prompt').length,1);
+});
+
+test('a skipped branch keeps its reason while the source is unresolved and clears it when resolved',async()=>{
+    const {graph,LiteGraph}=graphMock();
+    const source=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(source);
+    source.title='人物';source.widgets[0].value='人物';source.widgets[1].value='source-job';
+    source.properties={astrogate_project:'p',astrogate_owner:'actor',astrogate_base_prompt:'人物'};
+    source.agStatus={textContent:'',classList:{toggle(){}}};
+    const target=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(target);
+    target.title='分镜';target.widgets[0].value='分镜';target.widgets[1].value='target-job';
+    target.properties={astrogate_project:'p',astrogate_owner:'shot',astrogate_base_prompt:'分镜'};
+    target.agStatus={textContent:'',classList:{toggle(){}}};
+    target.addInput('reference_images.reference_1','IMAGE');source.connect(0,target,0);
+    let sourceStatus='unknown';
+    const api={fetchApi:async(path)=>({ok:true,json:async()=>{
+        if(path.endsWith('/jobs/source-job'))return {id:'source-job',status:sourceStatus};
+        if(path.endsWith('/jobs/target-job'))return {id:'target-job',status:'blocked'};
+        if(path.endsWith('?summary=1'))return {jobs:[{id:'source-job',kind:'image',status:sourceStatus},{id:'target-job',kind:'image',status:'blocked'}]};
+        return {};
+    }})};
+    const app={registerExtension(){},graph,nodeOutputs:{}};
+    const {generate,poll}=await load(app,{FormData:class{}},api);
+    await generate([target]);
+    await poll();
+    assert.match(target.agStatus.textContent,/人物.*结果未知.*重绘/);
+    sourceStatus='succeeded';
+    await poll();
+    assert.equal(target.agSkipped,undefined);
+    assert.match(target.agStatus.textContent,/本批次未执行/);
+});
+
+test('unknown image recovery queries without regeneration and only shows a saved result as complete',async()=>{
+    const elements=[];
+    class Element {
+        constructor(tag){this.tag=tag;this.children=[];this.events={};this.classList={toggle(){}};elements.push(this);}
+        append(...items){this.children.push(...items);}
+        replaceChildren(...items){this.children=items;}
+        addEventListener(name,fn){this.events[name]=fn;}
+        getAttribute(name){return this[name];}
+        removeAttribute(name){delete this[name];}
+    }
+    class ResizeObserver {observe(){} disconnect(){}}
+    const {graph,LiteGraph}=graphMock();graph.change=()=>{};
+    const node=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(node);
+    node.title='未知图片';node.properties={astrogate_project:'p',astrogate_kind:'shot'};
+    node.widgets[1].value='unknown-job';node.widgets.forEach(w=>{w.options={values:['16:9','4K','high']};});
+    node.addDOMWidget=()=>({options:{}});node.setSize=size=>node.size=size;node.computeSize=()=>[430,440];
+    const calls=[];
+    let status='pending';
+    const api={apiURL:path=>path,fetchApi:async(path,options)=>{
+        calls.push([path,options?.method]);
+        const result=path.endsWith('/recover')?{status,...(status==='succeeded'?{saved_result:{filename:'saved.png',type:'output',subfolder:'AstroGate'}}:{})}:
+            path.endsWith('?summary=1')?{jobs:[{id:'unknown-job',kind:'image',status:'unknown'}]}:{};
+        return {ok:true,json:async()=>result};
+    }};
+    const app={registerExtension(){},graph,nodeOutputs:{}};
+    const {installFrame,poll}=await load(app,{ResizeObserver,document:{createElement:tag=>new Element(tag)},FormData:class{}},api);
+    installFrame(node);
+    const recover=elements.find(e=>e.textContent==='查询并取回');
+    assert.equal(recover.hidden,true);
+    await poll();assert.equal(recover.hidden,false);
+    await recover.events.click();
+    assert.match(node.agProgress.label.textContent,/尚未确认结果.*不会重复提交/);
+    await poll();assert.match(node.agProgress.label.textContent,/尚未确认结果/);
+    status='missing';await recover.events.click();
+    assert.match(node.agStatus.textContent,/未找到结果.*重绘/);
+    status='expired';await recover.events.click();
+    assert.match(node.agStatus.textContent,/已过期.*重绘/);
+    status='unavailable';await recover.events.click();
+    assert.match(node.agStatus.textContent,/暂不可用.*稍后再查询/);
+    status='succeeded';await recover.events.click();
+    assert.equal(node.properties.astrogate_images[0].filename,'saved.png');
+    assert.equal(node.agImage.hidden,false);assert.equal(recover.hidden,true);
+    assert.equal(node.agProgress.bar.value,1);
+    assert.equal(calls.filter(([path])=>path.endsWith('/recover')).length,5);
+    assert.equal(calls.some(([path])=>path==='/prompt'||path.endsWith('/native/prepare')),false);
+});
+
 function analysisGraph() {
     const {graph, LiteGraph} = graphMock();
     const file = LiteGraph.createNode('AstroGateTXT');

@@ -222,6 +222,52 @@ async def test_timeout_becomes_unknown_with_no_retry(modules, project, monkeypat
         await modules.node.AstroGateStoryboardFrame.execute(job["prompt"], job["id"])
 
 
+async def test_image_timeout_is_configurable_and_does_not_retry(modules, monkeypatch, aiohttp_server):
+    m = modules.node
+    monkeypatch.delenv('ASTROGATE_IMG_TIMEOUT', raising=False)
+    assert m.image_timeout().total == 900 and m.image_timeout().connect == 15
+    calls = []
+    async def handle(request):
+        calls.append(request.path)
+        await asyncio.sleep(.2)
+        return web.json_response({'data':[]})
+    app = web.Application()
+    app.router.add_post('/images/generations', handle)
+    server = await aiohttp_server(app)
+    monkeypatch.setattr(m, 'API_BASE', str(server.make_url('/')).rstrip('/'))
+    monkeypatch.setenv('ASTROGATE_IMG_TIMEOUT', '.05')
+    with pytest.raises(RuntimeError, match='超时'):
+        await m.generate_image({'prompt':'test'}, False)
+    assert calls == ['/images/generations']
+    monkeypatch.setenv('ASTROGATE_IMG_TIMEOUT', '0')
+    with pytest.raises(ValueError, match='正数'):
+        m.image_timeout()
+
+
+async def test_cancelled_inflight_image_remains_unknown_and_is_not_retried(modules, project, monkeypatch):
+    m = modules.node
+    native = sys.modules[m.__name__ + '.storyboard.native']
+    job = native.prepare_native(modules.store,project,{'owner_id':'shot1','owner_type':'shot','prompt':'客栈',
+        'settings':{},'references':[]})
+    entered = asyncio.Event()
+    calls = []
+    async def generate(*args):
+        calls.append('sent')
+        entered.set()
+        await asyncio.Event().wait()
+    monkeypatch.setattr(m,'generate_image',generate)
+    task = asyncio.create_task(m.AstroGateStoryboardFrame.execute('客栈',job['id']))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert calls == ['sent']
+    assert modules.store.job(job['id'])['status'] == 'unknown'
+    with pytest.raises(ValueError, match='未知'):
+        native.prepare_native(modules.store,modules.store.get(project['id']),{'owner_id':'shot1','owner_type':'shot',
+            'prompt':'客栈','settings':{},'references':[]})
+
+
 async def test_text_model_configuration_keeps_channels_separate(modules, aiohttp_server, monkeypatch):
     calls = []
     async def handle(request):
@@ -603,6 +649,39 @@ async def test_global_style_changes_without_reanalysis_and_marks_frames_stale(mo
     assert '画风：水彩绘本' in modules.graph.render_prompt(modules.graph.snapshot(saved,saved['shots'][0]),[])
 
 
+async def test_image_recovery_requires_unknown_job_and_project_owner(modules, project, monkeypatch, aiohttp_client):
+    service = sys.modules[modules.node.__name__ + '.storyboard.service']
+    unknown = modules.store.add_job(project['id'], {'kind':'image','status':'unknown'})
+    complete = modules.store.add_job(project['id'], {'kind':'image','status':'succeeded'})
+    text = modules.store.add_job(project['id'], {'kind':'text','status':'unknown'})
+    calls = []
+    async def recover(store, job):
+        calls.append((store,job['id']))
+        return {'status':'pending'}
+    def create_app(callback):
+        routes = web.RouteTableDef()
+        monkeypatch.setattr(service,'PromptServer',SimpleNamespace(instance=SimpleNamespace(routes=routes,
+            user_manager=SimpleNamespace(get_request_user_id=lambda request:request.headers.get('X-Test-User','default')))))
+        monkeypatch.setattr(service,'get_store',lambda:modules.store)
+        service.register_routes(callback)
+        app = web.Application()
+        app.add_routes(routes)
+        return app
+    client = await aiohttp_client(create_app(recover))
+    response = await client.post('/astrogate/storyboard/jobs/'+unknown['id']+'/recover')
+    assert response.status==200 and (await response.json())['status']=='pending'
+    assert calls==[(modules.store,unknown['id'])]
+    for job in (complete,text):
+        response = await client.post('/astrogate/storyboard/jobs/'+job['id']+'/recover')
+        assert response.status==400
+    response = await client.post('/astrogate/storyboard/jobs/'+unknown['id']+'/recover',headers={'X-Test-User':'other'})
+    assert response.status==400 and len(calls)==1
+    assert modules.store.job(unknown['id'])['status']=='unknown'
+    unsupported = await aiohttp_client(create_app(None))
+    response = await unsupported.post('/astrogate/storyboard/jobs/'+unknown['id']+'/recover')
+    assert response.status==400 and '不支持' in (await response.json())['error']
+
+
 async def test_approving_character_views_preserves_locked_versions_and_reuses_the_pair(modules, project, monkeypatch, aiohttp_client):
     native = sys.modules[modules.node.__name__ + '.storyboard.native']
     service = sys.modules[modules.node.__name__ + '.storyboard.service']
@@ -771,6 +850,53 @@ async def test_native_frame_orders_actual_inputs_and_durably_reuses(modules, pro
     assert len(sent) == 1
 
 
+@pytest.mark.parametrize('status', ['succeeded','pending','missing','expired','unavailable'])
+async def test_recover_result_only_queries_gateway_without_generating(modules, project, monkeypatch, tmp_path, aiohttp_server, status):
+    native = sys.modules[modules.node.__name__ + '.storyboard.native']
+    m = modules.node
+    job = native.prepare_native(modules.store, project, {'owner_id':'shot1','owner_type':'shot',
+        'prompt':'两人在客栈相遇','settings':{'resolution':'original'},'references':[]})
+    modules.store.update_job(job['id'],status='unknown',error='结果未知')
+    buffer=BytesIO()
+    Image.new('RGB',(16,9),'blue').save(buffer,format='PNG')
+    calls=[]
+    async def lookup(request):
+        calls.append((request.method,request.match_info['request_id']))
+        assert request.headers['Authorization']=='Bearer test-only-image'
+        return web.json_response({'status':status,'result':{'data':[{'b64_json':m.base64.b64encode(buffer.getvalue()).decode()}]}})
+    app=web.Application()
+    app.router.add_get('/images/jobs/{request_id}',lookup)
+    server=await aiohttp_server(app)
+    monkeypatch.setattr(m,'API_BASE',str(server.make_url('/')).rstrip('/'))
+    monkeypatch.setattr(m.folder_paths,'output_directory',str(tmp_path/'output'))
+    (tmp_path/'output').mkdir()
+    result=await m.recover_storyboard_image(modules.store,modules.store.job(job['id']))
+    assert result['status']==status and calls==[('GET',job['gateway_request_id'])]
+    saved=modules.store.job(job['id'])
+    if status=='succeeded':
+        assert saved['status']=='succeeded' and saved['error'] is None
+        assert (tmp_path/'output'/result['saved_result']['subfolder']/result['saved_result']['filename']).is_file()
+        assert modules.store.image_path(saved['result_image']['file']).is_file()
+        assert modules.store.get(project['id'])['shots'][0]['latest_job_id']==job['id']
+    else:
+        assert saved['status']=='unknown' and 'saved_result' not in saved
+
+
+async def test_missing_saved_image_can_be_recovered_without_regenerating(modules, project, monkeypatch):
+    native = sys.modules[modules.node.__name__ + '.storyboard.native']
+    m = modules.node
+    job = native.prepare_native(modules.store, project, {'owner_id':'shot1','owner_type':'shot',
+        'prompt':'两人在客栈相遇','settings':{},'references':[]})
+    modules.store.update_job(job['id'],status='succeeded',result_image={'file':'astrogate/missing.png'},
+                             saved_result={'filename':'missing.png','subfolder':'','type':'output'})
+    async def fail_if_called(*args):
+        raise AssertionError('The missing cache must not trigger image generation')
+    monkeypatch.setattr(m,'generate_image',fail_if_called)
+    await m.AstroGateStoryboardFrame.execute('两人在客栈相遇',job['id'],element_id='shot1')
+    saved=modules.store.job(job['id'])
+    assert saved['status']=='unknown' and '查询并取回' in saved['error']
+
+
 async def test_native_analysis_reuses_result_without_text_call(modules, project, monkeypatch):
     native = sys.modules[modules.node.__name__ + '.storyboard.native']
     calls = []
@@ -907,6 +1033,85 @@ async def test_native_executor_parallel_images_wait_for_their_references(modules
     assert peak == 2 and finished == {'a','b','c','target'}
     assert all(modules.store.job(job['id'])['status'] == 'succeeded' for job in jobs.values())
     assert len({modules.store.job(job['id'])['result_image']['file'] for job in jobs.values()}) == 4
+
+
+@pytest.mark.parametrize('failure', ['before_request', 'unknown'])
+async def test_failed_native_image_blocks_only_dependent_branch(modules, project, monkeypatch, tmp_path, aiohttp_client, failure):
+    m = modules.node
+    native = sys.modules[m.__name__ + '.storyboard.native']
+    service = sys.modules[m.__name__ + '.storyboard.service']
+    project['shots'] = [{**copy.deepcopy(project['shots'][0]), 'id':name} for name in ('bad','dependent','independent','story')]
+    modules.store.change(project['id'],lambda p:p.update(shots=project['shots']))
+    jobs, prompt = {}, {}
+    for name in ('bad','dependent','independent','story'):
+        refs = [{'slot':'reference_images.reference_1','purpose':'出错的参考图','job_id':jobs['bad']['id']}] if name=='dependent' else []
+        body = {'owner_id':name,'owner_type':'shot','prompt':name,'settings':{'resolution':'original'},'references':refs}
+        if name=='story':
+            body['story_parent_id']='bad'
+        jobs[name] = native.prepare_native(modules.store,project,body)
+        inputs = {'prompt':name,'job_id':jobs[name]['id'],'element_id':name}
+        if name=='dependent':
+            inputs['reference_images.reference_1']=['bad',0]
+        if name=='story':
+            inputs['story_context']=['bad',1]
+        if name=='bad' and failure=='before_request':
+            inputs['prompt']='已修改的提示词'
+        prompt[name] = {'class_type':'AstroGateStoryboardFrame','inputs':inputs}
+    sent = []
+    names = {job['gateway_request_id']:name for name,job in jobs.items()}
+    async def generate(payload, edit):
+        name = names[payload['gateway_request_id']]
+        sent.append(name)
+        if name=='bad':
+            raise RuntimeError('图片请求超时')
+        buffer = BytesIO()
+        Image.new('RGB',(16,9),'blue').save(buffer,format='PNG')
+        return {'data':[{'b64_json':m.base64.b64encode(buffer.getvalue()).decode()}]}
+    monkeypatch.setattr(m,'generate_image',generate)
+    monkeypatch.setattr(m,'PromptServer',SimpleNamespace(instance=SimpleNamespace(send_progress_text=lambda *args:None)))
+    monkeypatch.setattr(m.folder_paths,'output_directory',str(tmp_path/'output'))
+    (tmp_path/'output').mkdir()
+    m.AstroGateStoryboardFrame.FINALIZE_SCHEMA()
+    monkeypatch.setitem(nodes.NODE_CLASS_MAPPINGS,'AstroGateStoryboardFrame',m.AstroGateStoryboardFrame)
+    events=[]
+    server=SimpleNamespace(client_id=None,last_node_id=None,send_sync=lambda event,data,*args:events.append((event,data)))
+    executor=PromptExecutor(server,cache_args={'ram':0,'ram_inactive':0})
+    await executor.execute_async(prompt,'branch-failure',{'client_id':'test'},['dependent','independent','story'])
+    assert executor.success,events
+    bad = modules.store.job(jobs['bad']['id'])
+    assert bad['status']==('failed' if failure=='before_request' else 'unknown')
+    assert sent.count('bad') == (0 if failure=='before_request' else 1)
+    assert 'dependent' not in sent and {'independent','story'} <= set(sent)
+    assert modules.store.job(jobs['independent']['id'])['status']=='succeeded'
+    assert modules.store.job(jobs['story']['id'])['status']=='succeeded'
+    dependent = modules.store.job(jobs['dependent']['id'])
+    assert dependent['status']=='prepared'
+    blocked_events = [(event, data) for event, data in events if event=='execution_error' and data.get('exception_type')=='ExecutionBlocked']
+    assert any(data['node_id']=='dependent' for _, data in blocked_events)
+    history_entry = {'prompt':[0,'branch-failure',prompt],'status':{'messages':blocked_events}}
+    state, reason = service.queue_failure(dependent,history_entry, {bad['id']:bad})
+    assert state=='blocked' and '出错的参考图' in reason
+    state, reason = service.queue_failure({'id':'unrelated'},history_entry)
+    assert state=='blocked' and 'dependent' not in reason and 'Execution Blocked' not in reason
+    state, reason = service.queue_failure(dependent,history_entry)
+    assert state=='blocked' and '参考图' in reason
+    modules.store.update_job(dependent['id'],prompt_id='branch-failure')
+    routes = web.RouteTableDef()
+    history = {'branch-failure':history_entry}
+    monkeypatch.setattr(service,'get_store',lambda:modules.store)
+    monkeypatch.setattr(service,'PromptServer',SimpleNamespace(instance=SimpleNamespace(routes=routes,
+        user_manager=SimpleNamespace(get_request_user_id=lambda request:'default'),
+        prompt_queue=SimpleNamespace(get_history=lambda:history))))
+    service.register_routes()
+    app = web.Application()
+    app.add_routes(routes)
+    client = await aiohttp_client(app)
+    response = await client.get('/astrogate/storyboard/projects/'+project['id']+'?summary=1')
+    assert response.status==200
+    state = {job['id']:job for job in (await response.json())['jobs']}
+    assert state[dependent['id']]['status']=='blocked' and '出错的参考图' in state[dependent['id']]['error']
+    assert state[bad['id']]['status']==bad['status']
+    assert state[jobs['independent']['id']]['status']=='succeeded'
 
 
 def test_native_locked_look_keeps_its_own_image_node(modules, project):
