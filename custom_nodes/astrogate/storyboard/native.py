@@ -94,7 +94,7 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
         if kind == "shot":
             props["astrogate_atmosphere"] = owner.get("atmosphere", "")
         parent = asset_by_id(project, owner.get("parent_id"))
-        purpose = {"character": "人物身份、脸型体貌，不套用服装", "look": "此人物的服装、发型和配饰",
+        purpose = {"character": "人物身份、脸型体貌，不套用服装", "look": "此人物的身份、服装、发型和配饰",
                    "scene": "场景空间布局，不自动带入参考图中的人物", "scene_state": "场景时段、天气与光线",
                    "prop": "道具外形与材质", "shot": "前镜空间与光线，人物名单以本镜为准"}[kind]
         props["astrogate_reference_purpose"] = f"{parent['name'] + ' / ' if parent else ''}{owner.get('name', owner.get('summary', ''))}：{purpose}"
@@ -143,6 +143,8 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
             nodes[-1]["title"] += " · 固定版本"
         if parent:
             links.append({"from": parent, "slot": 0, "to": key, "input": "reference_images.reference_1", "type": "IMAGE", "label": "身份/场景基准"})
+            if asset["kind"] == "look" and assets[parent]["kind"] == "character":
+                links.append({"from": parent + "::left", "slot": 0, "to": key, "input": "reference_images.reference_2", "type": "IMAGE", "label": "人物左视基准"})
         if view:
             nodes[-1]["title"] += " · 正视"
             left_key = key + "::left"
@@ -164,12 +166,12 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
         add(shot, "shot", shot["image_prompt"], [shot_column + (index % 3) * 500, 80 + (index // 3) * 800], job)
         refs = []
         seen = set()
-        for item in shot_bindings(shot):
+        selected_refs = ([shot["scene"]] if shot.get("scene") else []) + [person.get("look") or person["identity"]
+            for person in shot.get("participants", []) if person.get("visible") is True] + shot.get("props", [])
+        for item in selected_refs:
             key = include_asset(item["asset_id"], item["version_id"] if item["policy"] == "locked" else None)
             if key not in seen:
                 refs.append(key)
-                if assets[key]["kind"] == "character":
-                    refs.append(key + "::left")
                 seen.add(key)
         if shot.get("previous_shot_id"):
             refs.append(shot["previous_shot_id"])
@@ -182,7 +184,7 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
             links.append({"from": shots[index - 1]["id"], "slot": 1, "to": shot["id"], "input": "story_context", "type": "ASTROGATE_STORY", "label": "叙事顺序"})
         nodes[-1]["title"] = f"{index + 1:03d} · {shot['summary']}"
         nodes[-1]["properties"]["astrogate_scene"] = asset_by_id(project, scene_id)["name"] if scene_id != "none" else "空镜 / 未指定场景"
-    return {"project_id": project["id"], "chapter_id": chapter_id, "nodes": nodes, "links": links}
+    return {"project_id": project["id"], "chapter_id": chapter_id, "reference_wiring_version": 2, "nodes": nodes, "links": links}
 
 
 def prepare_native(store, project, body):

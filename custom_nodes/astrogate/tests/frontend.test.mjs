@@ -23,6 +23,7 @@ function graphMock() {
             findInputSlot(name) { return this.inputs.findIndex(i => i.name === name); },
             addInput(name, type) { this.inputs.push({name, type}); }, setDirtyCanvas() {},
             connect(output, target, slot) { const id = ++linkId; graph.links[id] = {origin_id: this.id, origin_slot: output, target_id: target.id}; target.inputs[slot].link = id; },
+            disconnectInput(slot) { const input = this.inputs[slot]; if (input?.link != null) { delete graph.links[input.link]; input.link = null; } },
         };
     }};
     return {graph, LiteGraph};
@@ -77,6 +78,51 @@ test("native board creates real image/story wires, shares assets and preserves m
     assert.equal(first.widgets[0].value, "手动改词");
     assert.deepEqual(first.pos, [900, 420]);
     assert.equal(first.inputs.find(i => i.name === "reference_images.reference_1").link, null);
+});
+test("existing shots drop redundant character views only when their look remains connected", async () => {
+    const {graph, LiteGraph} = graphMock();
+    graph.change = () => {};
+    const board = LiteGraph.createNode("AstroGateStoryboard"); board.pos = [0, 0]; graph.add(board);
+    const {mountGraph, changed} = await load({registerExtension() {}, graph, nodeOutputs: {}}, {LiteGraph});
+    const items = [
+        ["front", "character", "person-a"], ["left", "character", "person-a"],
+        ["look", "look", "look-a"], ["other", "character", "person-b"], ["shot", "shot", "shot"],
+    ].map(([id,kind,owner],i) => ({id,type:"AstroGateStoryboardFrame",title:id,pos:[i*500,100],
+        widgets:{prompt:id,job_id:"job-"+id,aspect_ratio:"16:9",resolution:"4K",quality:"high"},
+        properties:{astrogate_project:"p",astrogate_key:id,astrogate_kind:kind,astrogate_owner:owner,
+            astrogate_base_prompt:id,astrogate_images:[{filename:id+".png"}]}}));
+    const wire = (from,to,input) => ({from,to,input,type:"IMAGE",slot:0});
+    const old = {project_id:"p",chapter_id:"c",nodes:items,links:[wire("front","look","reference_images.reference_1"),
+        wire("front","shot","reference_images.reference_1"),wire("left","shot","reference_images.reference_2"),
+        wire("look","shot","reference_images.reference_3"),wire("other","shot","reference_images.reference_4")]};
+    const mapping = mountGraph(board,old);
+    const shot = mapping.get("shot"), look = mapping.get("look");
+    const next = {...old,reference_wiring_version:2,links:[wire("front","look","reference_images.reference_1"),
+        wire("look","shot","reference_images.reference_1"),wire("other","shot","reference_images.reference_2")]};
+    assert.equal(changed(shot),false);
+    mountGraph(board,next);
+    assert.deepEqual(shot.inputs.map(i=>i.link == null ? null : graph.links[i.link].origin_id),[null,null,look.id,mapping.get("other").id]);
+    assert.equal(shot.properties.astrogate_images[0].filename,"shot.png");
+    assert.equal(changed(shot),false);
+    assert.equal(board.properties.astrogate_wiring_version,2);
+    assert.notEqual(look.inputs[0].link,null);
+});
+test("wiring migration preserves deliberately assigned reference roles", async () => {
+    const {graph, LiteGraph} = graphMock();
+    graph.change = () => {};
+    const board = LiteGraph.createNode("AstroGateStoryboard"); board.pos = [0,0]; graph.add(board);
+    const {mountGraph} = await load({registerExtension(){},graph,nodeOutputs:{}},{LiteGraph});
+    const nodes = [["front","character","person"],["look","look","look"],["shot","shot","shot"]].map(([id,kind,owner],i)=>({
+        id,type:"AstroGateStoryboardFrame",title:id,pos:[i*500,100],widgets:{prompt:id,job_id:"",aspect_ratio:"16:9",resolution:"4K",quality:"high"},
+        properties:{astrogate_project:"p",astrogate_key:id,astrogate_kind:kind,astrogate_owner:owner,astrogate_base_prompt:id}}));
+    const wire = (from,to,input)=>({from,to,input,type:"IMAGE",slot:0});
+    const old = {project_id:"p",chapter_id:"c",nodes,links:[wire("front","look","reference_images.reference_1"),
+        wire("front","shot","reference_images.reference_1"),wire("look","shot","reference_images.reference_2")]};
+    const mapping=mountGraph(board,old), shot=mapping.get("shot"), front=mapping.get("front");
+    shot.properties.astrogate_reference_roles={"reference_images.reference_1":{source:String(front.id),role:"style",detail:"保留构图"}};
+    mountGraph(board,{...old,reference_wiring_version:2,links:[wire("front","look","reference_images.reference_1"),wire("look","shot","reference_images.reference_1")]});
+    assert.equal(graph.links[shot.inputs[0].link].origin_id,front.id);
+    assert.equal(shot.properties.astrogate_reference_roles["reference_images.reference_1"].detail,"保留构图");
 });
 test("story edges never prepare or regenerate the preceding image", async () => {
     const {graph, LiteGraph} = graphMock();
@@ -417,8 +463,7 @@ test('building a chapter queues images once and the saved auto marker survives r
         properties:{astrogate_project:'project',astrogate_owner:id==='shot'?'shot':'actor',astrogate_owner_type:id==='shot'?'shot':'asset',astrogate_key:id,astrogate_kind:id==='shot'?'shot':'character',astrogate_view:id==='shot'?'':id,astrogate_base_prompt:id}})),
         links:[...['front','left','shot'].map(to=>({from:'$board',slot:0,to,input:'board',type:'ASTROGATE_BOARD'})),
             {from:'front',slot:0,to:'left',input:'reference_images.reference_1',type:'IMAGE'},
-            {from:'front',slot:0,to:'shot',input:'reference_images.reference_1',type:'IMAGE'},
-            {from:'left',slot:0,to:'shot',input:'reference_images.reference_2',type:'IMAGE'}]};
+            {from:'front',slot:0,to:'shot',input:'reference_images.reference_1',type:'IMAGE'}]};
     const calls=[];
     const api={fetchApi:async(path,options)=>{
         const body=options?.body?JSON.parse(options.body):null;
@@ -433,15 +478,50 @@ test('building a chapter queues images once and the saved auto marker survives r
     assert.equal(calls.filter(([p])=>p.endsWith('/native/canvas')).length,1);
     assert.equal(calls.filter(([p])=>p==='/prompt').length,1);
     const prepared=calls.filter(([p])=>p.endsWith('/native/prepare')).map(([,b])=>b);
-    assert.deepEqual(prepared.map(b=>b.prompt),['front','left','shot']);
-    assert.equal(prepared[1].references[0].job_id,'job-front');
-    assert.equal(prepared[1].view,'left');
+    assert.deepEqual(prepared.map(b=>b.prompt),['front','shot','left']);
+    const left=prepared.find(b=>b.prompt==='left');
+    assert.equal(left.references[0].job_id,'job-front');
+    assert.equal(left.view,'left');
     assert.equal(board.properties.astrogate_generation_jobs.length,3);
     await buildBoard(board,info,true);
     assert.equal(calls.filter(([p])=>p==='/prompt').length,1);
     board.properties.astrogate_autogenerate=false;
     await buildBoard(board,{...info,analysis_id:'another'});
     assert.equal(calls.filter(([p])=>p==='/prompt').length,1);
+});
+
+test('migrating an existing chapter simplifies wiring without starting a new image batch',async()=>{
+    const {graph,LiteGraph,board}=analysisGraph();
+    const info={project_id:'project',chapter_id:'chapter-id',analysis_id:'analysis'};
+    board.properties.astrogate_board=info;
+    const recipe={...info,reference_wiring_version:2,nodes:[{id:'shot',type:'AstroGateStoryboardFrame',title:'shot',pos:[500,100],
+        widgets:{prompt:'shot',job_id:'',aspect_ratio:'16:9',resolution:'1K',quality:'high'},
+        properties:{astrogate_project:'project',astrogate_owner:'shot',astrogate_key:'shot',astrogate_kind:'shot',astrogate_base_prompt:'shot'}}],
+        links:[{from:'$board',slot:0,to:'shot',input:'board',type:'ASTROGATE_BOARD'}]};
+    const calls=[];
+    const api={fetchApi:async(path)=>{calls.push(path);return {ok:true,json:async()=>path.endsWith('/native/canvas')?recipe:{}};}};
+    const app={registerExtension(){},graph,nodeOutputs:{},canvas:{ds:{},centerOnNode(){},selectNode(){}}};
+    const {buildBoard}=await load(app,{LiteGraph,FormData:class{}},api);
+    await buildBoard(board,info);
+    assert.equal(board.properties.astrogate_wiring_version,2);
+    assert.equal(calls.includes('/prompt'),false);
+});
+
+test('existing chapter wiring waits for running image jobs before migration',async()=>{
+    const {graph,LiteGraph,board}=analysisGraph();
+    board.properties.astrogate_board={project_id:'project',chapter_id:'chapter-id',analysis_id:'analysis'};
+    board.properties.astrogate_layout_version=2;
+    const calls=[];
+    const jobs=[{id:'analysis',kind:'text',status:'succeeded',analysis_key:expectedAnalysisKey,chapter_id:'chapter-id'},
+        {id:'image',kind:'image',status:'running',prompt_id:'prompt'}];
+    const api=analysisAPI(calls,jobs);
+    const app={registerExtension(){},graph,nodeOutputs:{},canvas:{ds:{},centerOnNode(){},selectNode(){}}};
+    const {poll}=await load(app,{LiteGraph,FormData:class{}},api);
+    await poll();
+    assert.equal(calls.filter(([path])=>path.endsWith('/native/canvas')).length,0);
+    jobs[1].status='succeeded';
+    await poll();
+    assert.equal(calls.filter(([path])=>path.endsWith('/native/canvas')).length,1);
 });
 
 test('global aspect changes scene frames while keeping character designs and old images',async()=>{

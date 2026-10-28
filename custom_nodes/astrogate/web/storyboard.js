@@ -324,6 +324,34 @@ function installFold(nodeType) {
         return result;
     };
 }
+function simplifyShotReferences(recipe, mapping) {
+    let changedWires = false;
+    for (const item of recipe.nodes.filter(n => n.properties.astrogate_kind === "shot")) {
+        const shot = mapping.get(item.id);
+        const refs = imageSources(shot);
+        const intended = new Set(recipe.links.filter(l => l.to === item.id && l.type === "IMAGE").map(l => l.from));
+        const characters = new Set();
+        for (const ref of refs) {
+            if (ref.node.properties.astrogate_kind !== "look" || !intended.has(ref.node.properties.astrogate_key)) continue;
+            for (const parent of imageSources(ref.node)) {
+                if (parent.node.properties.astrogate_kind === "character") characters.add(parent.node.properties.astrogate_owner);
+            }
+        }
+        const removable = refs.filter(ref => ref.node.properties.astrogate_kind === "character" &&
+            characters.has(ref.node.properties.astrogate_owner) && !intended.has(ref.node.properties.astrogate_key) &&
+            referenceChoice(shot, ref).role === "auto" && !referenceChoice(shot, ref).detail);
+        if (!removable.length) continue;
+        const unchanged = !changed(shot);
+        for (const ref of removable) {
+            const slot = shot.findInputSlot(ref.slot);
+            if (slot >= 0) shot.disconnectInput(slot);
+        }
+        if (unchanged) shot.properties.astrogate_signature = nodeSignature(shot);
+        labelReferences(shot);
+        changedWires = true;
+    }
+    if (changedWires) app.graph.change();
+}
 function mountGraph(board, recipe, relayout = false) {
     const mapping = new Map([["$board", board]]);
     const created = new Set();
@@ -363,6 +391,10 @@ function mountGraph(board, recipe, relayout = false) {
         const target = mapping.get(link.to);
         // Restoring or arranging a chapter preserves manually edited wires and prompts.
         if (created.has(target) || upgrade.has(target)) connect(mapping.get(link.from), link.slot, target, link.input, link.type);
+    }
+    if (recipe.reference_wiring_version === 2 && board.properties.astrogate_wiring_version !== 2) {
+        simplifyShotReferences(recipe, mapping);
+        board.properties.astrogate_wiring_version = 2;
     }
     for (const node of created) {
         labelReferences(node);
@@ -408,18 +440,20 @@ async function addSceneAngle(source, view) {
 async function buildBoard(board, info, relayout = false) {
     if (board.agBuilding) return board.agBuilding;
     board.agBuilding = (async () => {
+        const migrating = board.properties.astrogate_board?.analysis_id === info.analysis_id && board.properties.astrogate_wiring_version !== 2;
         board.properties.astrogate_board = info;
         await applyFrameAspect(board);
         const recipe = await request(`/projects/${info.project_id}/native/canvas`, info);
+        board.agWiringChecked = recipe.reference_wiring_version !== 2;
         const mapping = mountGraph(board, recipe, relayout || board.properties.astrogate_layout_version !== 2);
         board.properties.astrogate_layout_version = 2;
         const frames = [...mapping.values()].filter(n => n.properties.astrogate_kind === "shot");
-        const auto = frames.length && board.properties.astrogate_autogenerate !== false && board.properties.astrogate_auto_started !== info.analysis_id;
+        const auto = frames.length && !migrating && board.properties.astrogate_autogenerate !== false && board.properties.astrogate_auto_started !== info.analysis_id;
         if (auto) board.properties.astrogate_auto_started = info.analysis_id;
         message(board, `已建立 ${frames.length} 个分镜与人物双视图。${auto ? "正在自动生成图片…" : "可生成本章或选中图片。"}`);
         await saveBoard(board);
         if (frames.length) focusNode([...mapping.values()].find(n => n.properties.astrogate_view === "front") || frames[0]);
-        if (auto) await generate(frames, false, board);
+        if (auto) await generate([...frames, ...[...mapping.values()].filter(n => n.properties.astrogate_view === "left")], false, board);
     })();
     try { return await board.agBuilding; }
     finally { delete board.agBuilding; }
@@ -702,7 +736,8 @@ function installBoard(node) {
     }), button(node, "生成本章图片", async () => {
         const info = node.properties.astrogate_board;
         if (!info) throw new Error("请先分析剧本。");
-        await generate(nodes().filter(n => n.properties.astrogate_project === info.project_id && n.properties.astrogate_chapter === info.chapter_id && n.properties.astrogate_kind === "shot"), false, node);
+        await generate(nodes().filter(n => n.properties.astrogate_project === info.project_id && n.properties.astrogate_chapter === info.chapter_id &&
+            (n.properties.astrogate_kind === "shot" || n.properties.astrogate_view === "left")), false, node);
     }), button(node, "停止分析", async () => {
         const context = await analysisContext(node);
         const promptId = node.properties.astrogate_prompt_key === context.key ? node.properties.astrogate_prompt_id : null;
@@ -722,7 +757,7 @@ function installBoard(node) {
         a.download = "astrogate-storyboard.zip";
         a.click();
     }));
-    root.append(autoLabel, controls, progressBar(node), element("p", "人物正视 → 左视 → 实际出场分镜。人物设计 2:3，其余使用上方统一画幅；图片 high / 4K。", "ag-hint"), node.agStatus);
+    root.append(autoLabel, controls, progressBar(node), element("p", "人物正视、左视 → 造型 → 实际出场分镜。人物设计 2:3，其余使用上方统一画幅；图片 high / 4K。", "ag-hint"), node.agStatus);
     node.size = [430, 650];
 }
 function installFrame(node) {
@@ -984,7 +1019,9 @@ async function poll() {
                 }
                 showAnalysisState(node, job);
                 batchProgress(node, jobs);
-                if (job?.status === "succeeded" && (node.properties.astrogate_board?.analysis_id !== job.id || node.properties.astrogate_layout_version !== 2)) {
+                const busy = submitting || result.jobs.some(j => j.kind === "image" &&
+                    (["running", "queued", "cancelling"].includes(j.status) || (j.status === "prepared" && j.prompt_id)));
+                if (job?.status === "succeeded" && !busy && (node.properties.astrogate_board?.analysis_id !== job.id || node.properties.astrogate_layout_version !== 2 || (node.properties.astrogate_wiring_version !== 2 && !node.agWiringChecked))) {
                     delete node.properties.astrogate_resume_job;
                     await buildBoard(node, {project_id: project, chapter_id: job.chapter_id, analysis_id: job.id});
                 }

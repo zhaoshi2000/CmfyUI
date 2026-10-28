@@ -522,8 +522,8 @@ def test_native_canvas_wires_draft_assets_and_separates_story(modules, project):
     recipe = native.native_canvas(modules.store, project, project['chapters'][0]['id'])
     assert len(recipe['nodes']) == 9
     refs = [l for l in recipe['links'] if l['to'] == 'shot2' and l['type'] == 'IMAGE']
-    assert len(refs) == 7
-    assert {l['from'] for l in refs} == {'林夏', '林夏::left', '蓝衣', '周野', '周野::left', '黑衣', '客栈'}
+    assert len(refs) == 3
+    assert {l['from'] for l in refs} == {'蓝衣', '黑衣', '客栈'}
     story = next(l for l in recipe['links'] if l['to'] == 'shot2' and l['type'] == 'ASTROGATE_STORY')
     assert story['from'] == 'shot1' and story['slot'] == 1
     assert all(l['from'] != 'shot1' for l in refs)
@@ -563,6 +563,28 @@ def test_character_pairs_have_stable_ids_layout_and_visible_cast_only(modules, p
         assert any(l['from']==name and l['to']==name+'::left' and l['type']=='IMAGE' for l in recipe['links'])
     assert all(n['widgets']['aspect_ratio']=='2.39:1' for n in recipe['nodes'] if n['properties']['astrogate_kind']!='character')
     assert len({tuple(n['pos']) for n in recipe['nodes']}) == len(recipe['nodes'])
+
+
+def test_shot_uses_each_visible_characters_look_or_front_and_look_uses_both_views(modules, project):
+    native = sys.modules[modules.node.__name__ + '.storyboard.native']
+    project['shots'][0]['participants'][1]['look'] = None
+    recipe = native.native_canvas(modules.store, project, project['chapters'][0]['id'])
+    shot_refs = [link['from'] for link in recipe['links'] if link['to']=='shot1' and link['type']=='IMAGE']
+    assert shot_refs == ['客栈', '蓝衣', '周野']
+    look_refs = [link['from'] for link in recipe['links'] if link['to']=='蓝衣' and link['type']=='IMAGE']
+    assert look_refs == ['林夏', '林夏::left']
+    assert '周野::left' not in shot_refs and '林夏' not in shot_refs
+
+
+def test_character_and_look_requests_require_clean_background_without_affecting_shots(modules, project):
+    native = sys.modules[modules.node.__name__ + '.storyboard.native']
+    bodies = [('林夏','asset','front'), ('林夏','asset','left'), ('蓝衣','asset',''), ('客栈','asset',''), ('shot1','shot','')]
+    jobs = [native.prepare_native(modules.store, project, {'owner_id':owner, 'owner_type':kind,
+        'view':view, 'prompt':'原提示词', 'settings':{}}) for owner,kind,view in bodies]
+    for job in jobs[:3]:
+        assert '人物设定参考图：' in job['prompt'] and '干净的纯白或浅灰单色' in job['prompt']
+        assert '其他人物' in job['prompt'] and '无场景' in job['prompt']
+    assert all('人物设定参考图：' not in job['prompt'] for job in jobs[3:])
 
 
 def test_front_and_left_jobs_do_not_conflict_or_reuse_each_other(modules, project):
@@ -759,7 +781,7 @@ def test_character_reference_sheet_keeps_people_and_view_order_separate(modules)
     assert '同一人物' in purposes[0]['purpose']
 
 
-async def test_native_pair_workflow_executes_front_then_left_and_sends_person_atlases(modules, project, monkeypatch, tmp_path):
+async def test_native_pair_workflow_uses_both_views_for_look_and_sends_looks_to_shot(modules, project, monkeypatch, tmp_path):
     m = modules.node
     native = sys.modules[m.__name__ + '.storyboard.native']
     recipe = native.native_canvas(modules.store, project, project['chapters'][0]['id'])
@@ -779,10 +801,13 @@ async def test_native_pair_workflow_executes_front_then_left_and_sends_person_at
         if key.endswith('::left'):
             assert key.removesuffix('::left') in completed
             assert edit and len(payload['images'])==1
+        if key in ('蓝衣','黑衣'):
+            assert edit and len(payload['images'])==1
+            assert '同一人物双视图图册' in payload['prompt']
         if key=='shot1':
-            assert {'林夏','林夏::left','周野','周野::left'} <= completed
+            assert {'蓝衣','黑衣'} <= completed
             assert len(payload['images'])==3
-            assert payload['prompt'].count('同一人物设定图册')==2
+            assert '同一人物双视图图册' not in payload['prompt']
         await asyncio.sleep(.01)
         data=BytesIO()
         Image.new('RGB',(16,24),'blue').save(data,format='PNG')
