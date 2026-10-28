@@ -631,16 +631,6 @@ function pickTXT(node) {
     });
     input.click();
 }
-function starter() {
-    const canvas = app.canvas;
-    const pos = [-canvas.ds.offset[0] + 160 / canvas.ds.scale, -canvas.ds.offset[1] + 140 / canvas.ds.scale];
-    const file = addNode("AstroGateTXT", pos);
-    const board = addNode("AstroGateStoryboard", [pos[0] + 490, pos[1]]);
-    connect(file, 0, board, "script", "ASTROGATE_SCRIPT");
-    focusNode(file);
-    pickTXT(file);
-    return file;
-}
 function installSource(node) {
     node.widgets.find(w => w.name === "project_id").hidden = true;
     const root = element("div", undefined, "ag-native ag-source");
@@ -1076,8 +1066,7 @@ app.registerExtension({
         }
     },
     getCanvasMenuItems() {
-        return [{content: "导入 TXT → AI 自动分镜", callback: starter},
-            {content: "生成选中的分镜图片", callback: () => {
+        return [{content: "生成选中的分镜图片", callback: () => {
                 const selected = Object.values(app.canvas.selected_nodes || {});
                 generate(selected).catch(error => { if (selected[0]) message(selected[0], error.message, false, true); });
             }}];
@@ -1088,21 +1077,6 @@ app.registerExtension({
         style.href = new URL("./storyboard.css", import.meta.url).href;
         document.head.append(style);
         activityPanel = createActivityPanel();
-        const bar = element("div", undefined, "ag-native-toolbar");
-        const importButton = element("button", "导入 TXT → AI 分镜");
-        importButton.type = "button";
-        importButton.addEventListener("click", () => {
-            try { starter(); } catch (error) { importButton.textContent = error.message; }
-        });
-        const selectedButton = element("button", "生成选中图片");
-        selectedButton.type = "button";
-        selectedButton.addEventListener("click", () => {
-            const selected = Object.values(app.canvas.selected_nodes || {}).filter(n => n.type === "AstroGateStoryboardFrame");
-            if (!selected.length) { selectedButton.textContent = "请先选中图片卡片"; setTimeout(() => selectedButton.textContent = "生成选中图片", 2500); return; }
-            generate(selected).catch(error => message(selected[0], error.message, false, true));
-        });
-        bar.append(importButton, selectedButton);
-        document.body.append(bar);
         api.addEventListener("execution_error", event => {
             const node = app.graph.getNodeById(event.detail.node_id);
             if (node?.type?.startsWith("AstroGate")) message(node, event.detail.exception_message || "执行失败，请查看任务信息", false, true);

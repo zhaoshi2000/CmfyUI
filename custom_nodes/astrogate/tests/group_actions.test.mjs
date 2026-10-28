@@ -26,9 +26,9 @@ function fixture() {
     return {graph, canvas, app, Group};
 }
 
-async function load(f, document = {}) {
-    const context = vm.createContext({LiteGraph: {LGraphGroup: f.Group}, document, queueMicrotask, setTimeout});
-    const module = new vm.SourceTextModule(source + "\nexport { groupSelection, ungroupSelection, installButtons };", {context});
+async function load(f) {
+    const context = vm.createContext({LiteGraph: {LGraphGroup: f.Group}});
+    const module = new vm.SourceTextModule(source + "\nexport { groupSelection, ungroupSelection };", {context});
     await module.link(() => new vm.SyntheticModule(["app"], function () { this.setExport("app", f.app); }, {context}));
     await module.evaluate();
     return module.namespace;
@@ -69,16 +69,11 @@ test("splitting an outer group leaves an inner group intact", async () => {
     assert.deepEqual(f.graph.nodes, [node]);
 });
 
-test("toolbar exposes grouping actions and does nothing when nothing is selected", async () => {
+test("canvas menu exposes grouping actions and does nothing when nothing is selected", async () => {
     const f = fixture();
-    const buttons = [];
-    const bar = {append(button) { buttons.push(button); }};
-    const document = {querySelector() { return bar; }, createElement() { return {addEventListener(type, callback) { this[type] = callback; }}; }};
-    const {installButtons, groupSelection, ungroupSelection} = await load(f, document);
-    assert.equal(groupSelection(), false);
-    assert.equal(ungroupSelection(), false);
-    installButtons();
-    assert.deepEqual(buttons.map(button => button.textContent), ["框选成组", "拆分组"]);
-    buttons[0].click();
-    assert.equal(buttons[0].textContent, "请先框选节点");
+    await load(f);
+    const items = f.app.extension.getCanvasMenuItems();
+    assert.deepEqual(Array.from(items, item => item.content), ["框选节点成组", "拆分选中组"]);
+    assert.equal(items[0].callback(), false);
+    assert.equal(items[1].callback(), false);
 });

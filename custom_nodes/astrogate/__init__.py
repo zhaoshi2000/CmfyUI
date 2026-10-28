@@ -545,7 +545,7 @@ class AstroGateStoryboardFrame(io.ComfyNode):
 class AstroGateTXT(io.ComfyNode):
     @classmethod
     def define_schema(cls):
-        return io.Schema(node_id="AstroGateTXT", display_name="导入 TXT 剧本", category="text/AstroGate",
+        return io.Schema(node_id="AstroGateTXT", display_name="导入文本", category="text",
                          description="点击节点里的选择 TXT 文件，将剧本输出连接到 AI 分镜脚本节点。",
                          inputs=[io.String.Input("project_id", default="", socketless=True)],
                          outputs=[io.Custom("ASTROGATE_SCRIPT").Output(display_name="剧本"), io.String.Output(display_name="原文")])

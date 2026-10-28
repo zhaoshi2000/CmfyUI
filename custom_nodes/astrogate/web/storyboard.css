@@ -1,7 +1,6 @@
-.ag-native-toolbar{position:fixed;top:58px;left:240px;z-index:30;display:flex;gap:6px;padding:5px;border:1px solid #3b4854;border-radius:9px;background:#182129;box-shadow:0 4px 18px #0005}
-.ag-native-toolbar button,.ag-native button{font:inherit;font-size:13px;color:#edf3fa;background:#2a3642;border:1px solid #465361;border-radius:6px;padding:8px 11px;cursor:pointer}
-.ag-native-toolbar button:first-child,.ag-native button.primary{background:#1678bd;border-color:#328ecb;color:white}
-.ag-native-toolbar button:hover,.ag-native button:hover{filter:brightness(1.18)}
+.ag-native button{font:inherit;font-size:13px;color:#edf3fa;background:#2a3642;border:1px solid #465361;border-radius:6px;padding:8px 11px;cursor:pointer}
+.ag-native button.primary{background:#1678bd;border-color:#328ecb;color:white}
+.ag-native button:hover{filter:brightness(1.18)}
 .ag-native button:disabled{opacity:.55;cursor:wait}
 .ag-native{font:13px/1.45 system-ui,sans-serif;color:#e1e8ed;background:#171d24;border-radius:8px;padding:10px;box-sizing:border-box;width:100%;height:100%;overflow:auto}
 .ag-native [hidden]{display:none!important}
@@ -36,7 +35,6 @@
 .ag-native .ag-atmosphere textarea{height:58px}
 .ag-hint{color:#92a8b9;font-size:11px;margin:5px 0;overflow-wrap:anywhere}
 .ag-file-info{white-space:pre-wrap;max-height:64px;overflow:auto;margin-bottom:10px;color:#bcd3e5}
-@media(max-width:900px){.ag-native-toolbar{left:110px;top:105px}}
 .ag-activity{position:fixed;left:76px;bottom:20px;z-index:45;width:300px;max-width:calc(100vw - 100px);box-sizing:border-box;background:#18212bed;color:#e1e8ed;border:1px solid #405265;border-radius:9px;box-shadow:0 5px 22px #0005;font:12px/1.5 system-ui,sans-serif}
 .ag-activity[open]{width:380px}
 .ag-activity>summary{display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;padding:9px 12px;user-select:none}

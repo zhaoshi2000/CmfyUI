@@ -32,30 +32,8 @@ function ungroupSelection() {
     return true;
 }
 
-function installButtons() {
-    const bar = document.querySelector(".ag-native-toolbar");
-    if (!bar) return;
-    for (const [label, hint, action] of [
-        ["框选成组", "先框选节点，再点击成组；拖动分组标题可一起移动", groupSelection],
-        ["拆分组", "选中分组后拆分；节点和连线保留", ungroupSelection],
-    ]) {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.textContent = label;
-        button.title = hint;
-        button.addEventListener("click", () => {
-            if (!action()) {
-                button.textContent = label === "框选成组" ? "请先框选节点" : "请先选中组";
-                setTimeout(() => button.textContent = label, 2500);
-            }
-        });
-        bar.append(button);
-    }
-}
-
 app.registerExtension({
     name: "AstroGate.GroupActions",
-    setup() { queueMicrotask(installButtons); },
     getCanvasMenuItems() {
         return [{content: "框选节点成组", callback: groupSelection}, {content: "拆分选中组", callback: ungroupSelection}];
     },

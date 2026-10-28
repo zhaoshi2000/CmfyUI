@@ -92,6 +92,17 @@ def test_schema_supports_native_connections_without_credentials(node):
     assert not any("key" in field for field in fields)
 
 
+def test_text_import_connects_to_storyboard(node):
+    source = node.AstroGateTXT.define_schema()
+    storyboard = node.AstroGateStoryboard.define_schema()
+    assert source.node_id == "AstroGateTXT"
+    assert source.display_name == "导入文本"
+    assert source.category == "text"
+    assert [output.io_type for output in source.outputs] == ["ASTROGATE_SCRIPT", "STRING"]
+    script = next(field for field in storyboard.inputs if field.id == "script")
+    assert script.get_io_type() == source.outputs[0].io_type
+
+
 def test_continuity_fields_and_local_cache_revision(node):
     schema = node.AstroGateImage.define_schema()
     assert schema.not_idempotent
