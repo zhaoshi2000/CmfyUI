@@ -432,6 +432,21 @@ def test_native_canvas_wires_draft_assets_and_separates_story(modules, project):
     assert all(n['widgets']['resolution'] == '4K' and n['widgets']['quality'] == 'high' for n in recipe['nodes'])
 
 
+def test_native_canvas_places_nested_props_beyond_look_and_scene(modules, project):
+    native = sys.modules[modules.node.__name__ + '.storyboard.native']
+    for name, parent in [('皮包', '黑衣'), ('皮包挂饰', '皮包'), ('木桌', '客栈'), ('油灯', '木桌')]:
+        project['assets'].append({'id': name, 'name': name, 'kind': 'prop', 'parent_id': parent,
+            'current_version_id': name + '1', 'versions': [{'id': name + '1', 'description': name, 'image': None}]})
+    project['shots'][0]['props'] = [modules.domain.binding(project, name) for name in ('皮包挂饰', '油灯')]
+    recipe = native.native_canvas(modules.store, project, project['chapters'][0]['id'])
+    positions = {n['id']: n['pos'] for n in recipe['nodes']}
+    assert len(set(map(tuple, positions.values()))) == len(positions)
+    for parent, child in [('周野', '黑衣'), ('黑衣', '皮包'), ('皮包', '皮包挂饰'), ('客栈', '木桌'), ('木桌', '油灯')]:
+        assert positions[parent][0] < positions[child][0]
+        assert any(link['from'] == parent and link['to'] == child and link['type'] == 'IMAGE' for link in recipe['links'])
+    assert positions['shot1'][0] >= max(pos[0] for key, pos in positions.items() if key != 'shot1') + 460
+
+
 async def test_native_frame_orders_actual_inputs_and_durably_reuses(modules, project, monkeypatch, tmp_path):
     native = sys.modules[modules.node.__name__ + '.storyboard.native']
     m = modules.node

@@ -103,13 +103,19 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
         links.append({"from": "$board", "slot": 0, "to": key, "input": "board", "type": "ASTROGATE_BOARD", "label": "所属分镜脚本"})
 
     positions = {}
+    def place_asset(key, depth, row):
+        positions[key] = [900 + depth * 480, 80 + row * 650]
+        children = [child for child in assets if parents.get(child) == key]
+        if not children:
+            return row + 1
+        for child in children:
+            row = place_asset(child, depth + 1, row)
+        return row
+
     row = 0
     for root in [key for key in assets if key not in parents]:
-        positions[root] = [900, 80 + row * 650]
-        children = [key for key in assets if parents.get(key) == root]
-        for index, child in enumerate(children):
-            positions[child] = [1380, 80 + (row + index) * 650]
-        row += max(1, len(children))
+        row = place_asset(root, 0, row)
+    shot_column = max(1940, max((pos[0] + 560 for pos in positions.values()), default=1940))
     for key, asset in assets.items():
         parent = parents.get(key)
         selected = version(asset)
@@ -126,7 +132,7 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
         scene_id = (shot.get("scene") or {}).get("asset_id", "none")
         # Chronological rows stay readable while assets are shared on the left.
         job = next((j for j in jobs if j["id"] == shot.get("latest_job_id")), None)
-        add(shot, "shot", shot["image_prompt"], [1940 + (index % 3) * 500, 80 + (index // 3) * 800], job)
+        add(shot, "shot", shot["image_prompt"], [shot_column + (index % 3) * 500, 80 + (index // 3) * 800], job)
         refs = []
         seen = set()
         for item in shot_bindings(shot):
