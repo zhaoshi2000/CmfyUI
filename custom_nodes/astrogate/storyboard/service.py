@@ -153,6 +153,8 @@ def register_routes():
                 if job["project_id"] != p["id"] or job.get("owner_type") != "asset" or job["status"] != "succeeded":
                     raise ValueError("该任务没有可定稿的素材图片。")
                 asset = asset_by_id(p, job["owner_id"])
+                if job.get("asset_view", "").startswith("scene_"):
+                    raise ValueError("补充机位已独立保存，请从场景基准节点设为定稿素材。")
                 if job.get("asset_view"):
                     selected = version(asset, job["asset_version_id"])
                     views = {}

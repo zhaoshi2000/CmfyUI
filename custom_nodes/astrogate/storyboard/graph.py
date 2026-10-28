@@ -54,6 +54,8 @@ def render_prompt(snap, refs):
         lines.extend(f"图{index + 1}：{ref['purpose']}" for index, ref in enumerate(refs))
         lines.append("每张图仅用于指定对象和用途，不混合不同人物的脸和服装。场景参考中的路人不自动入画。上一帧只参考空间关系，人物名单以本镜为准。")
     lines.append("只绘制指定的设定素材；默认无文字标签和水印。" if "asset_description" in snap["shot"] else "只画本镜列出的可见人物；默认无字幕、文字标签和水印。")
+    if snap["shot"].get("asset_kind") in ("scene", "scene_state"):
+        lines.append("无人环境素材：只绘制建筑、空间、陈设与光照。画面中禁止出现任何人物、路人、人体、剪影或人物倒影；参考图中即使有人也必须移除。保留同一场景的空间布局，不绘制剧情事件。")
     prompt = "\n".join(lines)
     if len(prompt) > 16000:
         raise ValueError("合并素材说明后的提示词超过16000字符，请精简设定。")

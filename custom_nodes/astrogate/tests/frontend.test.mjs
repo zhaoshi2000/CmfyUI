@@ -7,7 +7,7 @@ import { webcrypto } from "node:crypto";
 const source = await readFile(new URL("../web/storyboard.js", import.meta.url), "utf8");
 async function load(app, extras = {}, api = {}) {
     const context = vm.createContext({queueMicrotask, structuredClone, console, JSON, Set, Map, URLSearchParams, TextEncoder, crypto: webcrypto, ...extras});
-    const module = new vm.SourceTextModule(source + "\nexport { installFold, mountGraph, changed, generate, installFrame, analysisContext, startAnalysis, showAnalysisState, poll, panelWidget, activityStatus, activityLines, message, createActivityPanel, buildBoard, applyFrameAspect, batchProgress };", {context});
+    const module = new vm.SourceTextModule(source + "\nexport { installFold, mountGraph, changed, generate, installFrame, analysisContext, startAnalysis, showAnalysisState, poll, panelWidget, activityStatus, activityLines, message, createActivityPanel, buildBoard, applyFrameAspect, batchProgress, addSceneAngle };", {context});
     await module.link(async specifier => {
         const name = specifier.includes("app.js") ? "app" : "api";
         return new vm.SyntheticModule([name], function () { this.setExport(name, name === "app" ? app : api); }, {context});
@@ -340,9 +340,11 @@ test('image card controls precede a folded prompt and batch progress counts only
     node.widgets[0].value='保留提示词';
     node.inputs=[{name:'reference_images.reference_1',link:11},{name:'reference_images.reference_2',link:22},{name:'board',link:33}];
     node.addDOMWidget=()=>({options:{}});node.setSize=size=>node.size=size;node.computeSize=()=>[430,440];
-    const {installFrame,batchProgress}=await load({registerExtension(){},graph,nodeOutputs:{}},{document:{createElement:tag=>new Element(tag)}},{apiURL:path=>path});
+    let resize, disconnected=false;
+    class ResizeObserver { constructor(callback){resize=callback;} observe(){} disconnect(){disconnected=true;} }
+    const {installFrame,batchProgress}=await load({registerExtension(){},graph,nodeOutputs:{}},{ResizeObserver,document:{createElement:tag=>new Element(tag)}},{apiURL:path=>path});
     installFrame(node);
-    const root=elements.find(e=>e.className==='ag-native ag-image-card');
+    const root=elements.find(e=>e.className==='ag-native ag-image-card').children[0];
     const detail=elements.find(e=>e.tag==='details');
     assert.equal(root.children[2].className,'ag-native-actions');
     assert.equal(root.children[4],detail);
@@ -359,11 +361,45 @@ test('image card controls precede a folded prompt and batch progress counts only
     assert.equal(detail.open,false);
     assert.equal(node.agImage.hidden,false);
     assert.equal(elements.find(e=>e.tag==='textarea').value,'保留提示词');
-    detail.open=true;detail.events.toggle();detail.open=false;detail.events.toggle();
+    detail.open=true;detail.events.toggle();root.offsetHeight=500;resize();
+    const expandedHeight=node.size[1];
+    detail.open=false;detail.events.toggle();root.offsetHeight=335;resize();
+    assert.ok(expandedHeight-node.size[1]>=160);
+    assert.ok(node.size[1]<440);
+    node.widgets.push({name:'$$canvas-image-preview'},{name:'$$node-text-preview'});
+    node.onDrawBackground();
+    assert.ok(node.widgets.slice(-2).every(w=>w.hidden));
     assert.equal(node.widgets[0].value,'保留提示词');
     assert.equal(node.agImage.hidden,false);
     node.properties.astrogate_generation_jobs=['a','b','c','d'];
     batchProgress(node,new Map([['a',{status:'succeeded'}],['b',{status:'running'}],['c',{status:'queued'}],['d',{status:'unknown'}]]));
     assert.equal(node.agProgress.bar.value,1);assert.equal(node.agProgress.bar.max,4);
     assert.match(node.agProgress.label.textContent,/已完成 1\/4.*未完成\/异常 1/);
+    node.onRemoved();assert.equal(disconnected,true);
+});
+
+test('extra scene angles are manual independent nodes referencing one base scene',async()=>{
+    const {graph,LiteGraph,board}=analysisGraph();
+    board.properties.astrogate_board={project_id:'project',chapter_id:'chapter'};
+    const source=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(source);
+    source.title='客栈';source.pos=[500,100];source.size=[430,400];
+    source.properties={astrogate_project:'project',astrogate_key:'scene',astrogate_owner:'scene',astrogate_owner_type:'asset',astrogate_kind:'scene',astrogate_version:'v1',astrogate_images:[{filename:'base.png'}]};
+    source.widgets[0].value='无人客栈';source.widgets[1].value='base-job';
+    source.addInput('board','ASTROGATE_BOARD');board.connect(0,source,0);
+    const app={registerExtension(){},graph,canvas:{ds:{},centerOnNode(){},selectNode(){}}};
+    const calls=[];
+    const {addSceneAngle}=await load(app,{LiteGraph,FormData:class{}},analysisAPI(calls,[]));
+    assert.equal(graph._nodes.length,3);
+    const left=await addSceneAngle(source,'scene_left');
+    assert.equal(left.properties.astrogate_owner,'scene');
+    assert.equal(left.properties.astrogate_view,'scene_left');
+    assert.equal(left.widgets[1].value,'');
+    assert.equal(left.properties.astrogate_images.length,0);
+    assert.match(left.widgets[0].value,/左侧机位.*仅改变摄影机/);
+    const ref=left.inputs.find(i=>i.name==='reference_images.reference_1');
+    assert.equal(graph.links[ref.link].origin_id,source.id);
+    assert.equal(await addSceneAngle(source,'scene_left'),left);
+    assert.equal(graph._nodes.length,4);
+    assert.equal(calls.filter(([p])=>p.endsWith('/native/prepare')).length,0);
+    assert.equal(source.widgets[1].value,'base-job');
 });

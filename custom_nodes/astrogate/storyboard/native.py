@@ -32,7 +32,7 @@ async def analyse_native(store, project_id, chapter_number, model, style, densit
 def asset_shot(project, asset):
     parent_version = version(asset).get("parent_version_id")
     return {"id": asset["id"], "summary": asset["name"], "image_prompt": version(asset)["description"],
-            "asset_description": version(asset)["description"], "participants": [],
+            "asset_description": version(asset)["description"], "asset_kind": asset["kind"], "participants": [],
             "props": [binding(project, asset["parent_id"], "locked" if parent_version else "follow_latest", parent_version)] if asset.get("parent_id") else [], "source_refs": asset.get("source_refs", [])}
 
 
@@ -200,8 +200,11 @@ def prepare_native(store, project, body):
     else:
         raise ValueError("节点归属类型无效。")
     view = body.get("view", "front" if kind == "asset" and asset["kind"] == "character" else "")
-    if view not in (("front", "left") if kind == "asset" and asset["kind"] == "character" else ("",)):
-        raise ValueError("人物设计视图无效。")
+    views = ("front", "left") if kind == "asset" and asset["kind"] == "character" else ("",)
+    if kind == "asset" and asset["kind"] in ("scene", "scene_state"):
+        views = ("", "scene_left", "scene_right", "scene_reverse", "scene_high")
+    if view not in views:
+        raise ValueError("素材视图无效。")
     shot["image_prompt"] = body["prompt"]
     if kind == "asset" and not view:
         shot["asset_description"] = body["prompt"]
@@ -236,7 +239,7 @@ def prepare_native(store, project, body):
     snap.update(settings=settings, story_parent_id=story_id, story_summary=story["summary"] if story else "")
     if story:
         snap["descriptions"].append(f"前情（只延续叙事，不自动画入前镜人物）：{story['summary']}")
-    fingerprint = digest([shot["image_prompt"], settings, refs, story_id, snap["story_summary"], snap["descriptions"], snap["people"], view])
+    fingerprint = digest([shot["image_prompt"], settings, refs, story_id, snap["story_summary"], snap["descriptions"], snap["people"], view, shot.get("asset_kind")])
     asset_version = asset["current_version_id"] if kind == "asset" else None
     jobs = [j for j in store.jobs(project["id"]) if j.get("owner_id") == owner_id and j.get("native") and j.get("asset_version_id") == asset_version
             and j.get("asset_view", "front" if view else "") == view]

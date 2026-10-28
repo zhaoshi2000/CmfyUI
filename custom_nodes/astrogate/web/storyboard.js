@@ -4,6 +4,8 @@ import { api } from "../../scripts/api.js";
 const base = "/astrogate/storyboard";
 const states = {prepared: "等待参考图 / 排队中", queued: "排队中", running: "正在生成", analysing: "正在分析剧本", succeeded: "已完成", failed: "失败", blocked: "本批次未执行", unknown: "结果未知 · 可明确重绘", cancelling: "正在停止", cancelled: "已取消"};
 const active = new Set(["prepared", "queued", "running", "analysing", "cancelling"]);
+const sceneOnly = "无人环境素材：只绘制建筑、空间、陈设与光照，不出现任何人物、路人、剪影或人物倒影。";
+const sceneAngles = {scene_left: "左侧机位", scene_right: "右侧机位", scene_reverse: "反打机位", scene_high: "高位俯视"};
 let activityPanel;
 const value = (node, name) => node.widgets?.find(w => w.name === name)?.value;
 const nodes = () => app.graph._nodes;
@@ -270,6 +272,16 @@ function restorePreview(node) {
         }
     }
 }
+function hideNativePreviews(node) {
+    let changed = false;
+    for (const widget of node.widgets || []) {
+        if (["$$canvas-image-preview", "$$node-text-preview"].includes(widget.name) && !widget.hidden) {
+            widget.hidden = true;
+            changed = true;
+        }
+    }
+    return changed;
+}
 function installFold(nodeType) {
     function apply(node) {
         for (const w of node.widgets || []) if (["prompt", "consistency"].includes(w.name)) w.hidden = Boolean(node.properties.astrogate_prompt_folded);
@@ -341,7 +353,7 @@ function mountGraph(board, recipe, relayout = false) {
     for (const node of created) {
         labelReferences(node);
         node.properties.astrogate_signature = nodeSignature(node);
-        node.setSize?.([430, Math.max(440, node.computeSize?.()[1] || 0)]);
+        node.setSize?.([430, node.computeSize?.()[1] || 400]);
     }
     app.graph.setDirtyCanvas(true, true);
     return mapping;
@@ -349,6 +361,35 @@ function mountGraph(board, recipe, relayout = false) {
 async function saveBoard(board) {
     const info = board.properties.astrogate_board;
     if (info) await request(`/projects/${info.project_id}/edit`, {action: "workflow", chapter_id: info.chapter_id, workflow: app.graph.serialize()});
+}
+async function addSceneAngle(source, view) {
+    const key = source.properties.astrogate_key + "::" + view;
+    const existing = nodes().find(n => n.properties.astrogate_project === source.properties.astrogate_project && n.properties.astrogate_key === key);
+    if (existing) { focusNode(existing); return existing; }
+    const index = Object.keys(sceneAngles).indexOf(view);
+    const pos = [source.pos[0] + source.size[0] + 70, source.pos[1] + index * 440];
+    let overlap;
+    while ((overlap = nodes().find(n => n.pos && n.size && pos[0] < n.pos[0] + n.size[0] + 30 && pos[0] + 460 > n.pos[0] && pos[1] < n.pos[1] + n.size[1] + 30 && pos[1] + 430 > n.pos[1]))) pos[1] = overlap.pos[1] + overlap.size[1] + 60;
+    const node = addNode("AstroGateStoryboardFrame", pos);
+    node.properties = {...source.properties, astrogate_key: key, astrogate_view: view, astrogate_images: [],
+        astrogate_prompt_folded: true, astrogate_references_folded: true,
+        astrogate_reference_purpose: `${source.title} · ${sceneAngles[view]}：同一无人场景的空间和光照参考`};
+    delete node.properties.astrogate_signature;
+    delete node.properties.astrogate_status;
+    node.title = `${source.title} · ${sceneAngles[view]}`;
+    const prompt = `${value(source, "prompt")}\n根据参考图改为${sceneAngles[view]}，仅改变摄影机位置和朝向，保留建筑结构、家具位置与光照关系；独立单幅，不拼贴。\n${sceneOnly}`;
+    for (const name of ["element_id", "aspect_ratio", "resolution", "quality"]) setValue(node, name, value(source, name));
+    setValue(node, "prompt", prompt);
+    setValue(node, "job_id", "");
+    node.properties.astrogate_base_prompt = prompt;
+    connect(source, 0, node, "reference_images.reference_1", "IMAGE");
+    const board = sourceNode(source, "board");
+    if (board) connect(board, 0, node, "board", "ASTROGATE_BOARD");
+    node.agRefresh?.();
+    labelReferences(node);
+    if (board) await saveBoard(board);
+    focusNode(node);
+    return node;
 }
 async function buildBoard(board, info, relayout = false) {
     if (board.agBuilding) return board.agBuilding;
@@ -631,11 +672,33 @@ function installFrame(node) {
     for (const w of node.widgets) if (["prompt", "job_id", "element_id", "aspect_ratio", "resolution", "quality"].includes(w.name)) w.hidden = true;
     node.hideOutputImages = true;
     const root = element("div", undefined, "ag-native ag-image-card");
+    const content = element("div");
+    root.append(content);
+    const cardHeight = () => (content.offsetHeight || (node.properties.astrogate_prompt_folded ? 335 : 500)) + 20;
     const computeSize = node.computeSize;
     node.computeSize = function () {
+        hideNativePreviews(this);
         const size = computeSize.apply(this, arguments);
-        if (this.properties.astrogate_references_folded) size[1] = this.properties.astrogate_prompt_folded ? 560 : 730;
+        if (this.properties.astrogate_references_folded) size[1] = cardHeight() + 60;
         return size;
+    };
+    const resizeCard = () => {
+        const height = node.computeSize()[1];
+        if (node.size[1] !== height) node.setSize([node.size[0], height]);
+        node.setDirtyCanvas(true, true);
+    };
+    const observer = new ResizeObserver(resizeCard);
+    observer.observe(content);
+    const removed = node.onRemoved;
+    node.onRemoved = function () {
+        observer.disconnect();
+        return removed?.apply(this, arguments);
+    };
+    const drawBackground = node.onDrawBackground;
+    node.onDrawBackground = function () {
+        const result = drawBackground?.apply(this, arguments);
+        if (hideNativePreviews(this)) resizeCard();
+        return result;
     };
     const referenceToggle = element("button", "", "ag-reference-toggle");
     referenceToggle.type = "button";
@@ -648,8 +711,7 @@ function installFrame(node) {
             if (folded) input.pos = [10, 14]; else delete input.pos;
         }
         if (folded) node.widgets_start_y = 44; else delete node.widgets_start_y;
-        node.setSize([node.size[0], Math.max(node.computeSize()[1], node.properties.astrogate_prompt_folded ? 560 : 730)]);
-        node.setDirtyCanvas(true, true);
+        resizeCard();
     };
     const drawSlots = node.drawSlots;
     node.drawSlots = function (ctx, options) {
@@ -711,10 +773,9 @@ function installFrame(node) {
     detail.append(summary, prompt, parameters);
     detail.addEventListener("toggle", () => {
         node.properties.astrogate_prompt_folded = !detail.open;
-        node.setSize([node.size[0], Math.max(node.computeSize()[1], detail.open ? 730 : 560)]);
-        node.setDirtyCanvas(true, true);
+        resizeCard();
     });
-    panelWidget(node, root, () => detail.open ? 665 : 500);
+    panelWidget(node, root, cardHeight);
     node.agStatus.hidden = true;
     const controls = element("div", undefined, "ag-native-actions");
     controls.append(button(node, "生成图像", () => generate([node]), "primary"), button(node, "重绘", () => generate([node], true)),
@@ -727,19 +788,32 @@ function installFrame(node) {
         message(node, "素材已定稿，其他章节可以复用。");
     });
     controls.append(approve);
-    root.append(referenceToggle, stage, controls, progressBar(node), detail, node.agStatus);
+    const addAngle = element("button", "添加角度");
+    addAngle.type = "button";
+    addAngle.addEventListener("click", event => new LiteGraph.ContextMenu(Object.entries(sceneAngles).map(([view, label]) => ({
+        content: label, callback: () => addSceneAngle(node, view).catch(error => message(node, error.message, false, true)),
+    })), {event}));
+    controls.append(addAngle);
+    content.append(referenceToggle, stage, controls, progressBar(node), detail, node.agStatus);
     node.agRefresh = () => {
+        if (!node.properties.astrogate_compact_card) {
+            node.properties.astrogate_prompt_folded = true;
+            node.properties.astrogate_compact_card = true;
+        }
+        const scene = ["scene", "scene_state"].includes(node.properties.astrogate_kind);
+        if (scene && !String(value(node, "prompt")).includes(sceneOnly)) setValue(node, "prompt", `${value(node, "prompt") || ""}\n${sceneOnly}`);
         prompt.value = value(node, "prompt") || "";
         for (const [select, w] of selects) select.value = w.value;
         detail.open = !node.properties.astrogate_prompt_folded;
         const ratio = selects.find(([, w]) => w.name === "aspect_ratio")[0];
         ratio.disabled = node.properties.astrogate_kind !== "character" && Boolean(sourceNode(node, "board"));
         ratio.title = ratio.disabled ? "在所连的 AI 分镜脚本节点统一设置画幅" : "人物设计图独立画幅";
-        approve.hidden = node.properties.astrogate_owner_type !== "asset";
+        approve.hidden = node.properties.astrogate_owner_type !== "asset" || node.properties.astrogate_view?.startsWith("scene_");
+        addAngle.hidden = !scene || node.properties.astrogate_view?.startsWith("scene_");
         node.agRefreshReferences();
         restorePreview(node);
     };
-    node.size = [430, 560];
+    node.size = [430, 400];
     node.agRefresh();
 }
 async function poll() {

@@ -522,6 +522,21 @@ def test_front_and_left_jobs_do_not_conflict_or_reuse_each_other(modules, projec
         native.prepare_native(modules.store, project, body)
 
 
+def test_scene_views_enforce_empty_environments_without_removing_story_cast(modules, project):
+    native = sys.modules[modules.node.__name__ + '.storyboard.native']
+    body = {'owner_id':'客栈','owner_type':'asset','prompt':'客栈大堂','settings':{'aspect_ratio':'16:9'}}
+    base = native.prepare_native(modules.store, project, body)
+    assert '禁止出现任何人物' in base['prompt']
+    left = native.prepare_native(modules.store, project, {**body,'view':'scene_left','prompt':'左侧机位',
+        'references':[{'slot':'reference_images.reference_1','job_id':base['id'],'purpose':'场景基准'}]})
+    assert left['id'] != base['id'] and left['asset_view']=='scene_left'
+    assert left['references'][0]['job_id']==base['id']
+    assert '参考图中即使有人也必须移除' in left['prompt']
+    frame = modules.graph.render_prompt(modules.graph.snapshot(project,project['shots'][0]),[])
+    assert '禁止出现任何人物' not in frame
+    assert '林夏' in frame and '周野' in frame
+
+
 async def test_approving_character_views_preserves_locked_versions_and_reuses_the_pair(modules, project, monkeypatch, aiohttp_client):
     native = sys.modules[modules.node.__name__ + '.storyboard.native']
     service = sys.modules[modules.node.__name__ + '.storyboard.service']
