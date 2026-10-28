@@ -7,7 +7,7 @@ import { webcrypto } from "node:crypto";
 const source = await readFile(new URL("../web/storyboard.js", import.meta.url), "utf8");
 async function load(app, extras = {}, api = {}) {
     const context = vm.createContext({queueMicrotask, structuredClone, console, JSON, Set, Map, URLSearchParams, TextEncoder, crypto: webcrypto, ...extras});
-    const module = new vm.SourceTextModule(source + "\nexport { installFold, mountGraph, changed, generate, installFrame, analysisContext, startAnalysis, showAnalysisState, poll, panelWidget, activityStatus, activityLines, message, createActivityPanel };", {context});
+    const module = new vm.SourceTextModule(source + "\nexport { installFold, mountGraph, changed, generate, installFrame, analysisContext, startAnalysis, showAnalysisState, poll, panelWidget, activityStatus, activityLines, message, createActivityPanel, buildBoard, applyFrameAspect, batchProgress };", {context});
     await module.link(async specifier => {
         const name = specifier.includes("app.js") ? "app" : "api";
         return new vm.SyntheticModule([name], function () { this.setExport(name, name === "app" ? app : api); }, {context});
@@ -271,4 +271,99 @@ test('compact log panel keeps logs when collapsed and cancels only the selected 
     assert.equal(stop.textContent,'停止此批次');
     panel.update([]);
     assert.match(log.textContent,/选择 TXT/);
+});
+
+test('building a chapter queues images once and the saved auto marker survives restore',async()=>{
+    const {graph,LiteGraph,board}=analysisGraph();
+    const recipe={project_id:'project',chapter_id:'chapter-id',nodes:['front','left','shot'].map((id,i)=>({id,type:'AstroGateStoryboardFrame',title:id,pos:[i*500,100],
+        widgets:{prompt:id,job_id:'',aspect_ratio:i<2?'2:3':'16:9',resolution:'1K',quality:'high'},
+        properties:{astrogate_project:'project',astrogate_owner:id==='shot'?'shot':'actor',astrogate_owner_type:id==='shot'?'shot':'asset',astrogate_key:id,astrogate_kind:id==='shot'?'shot':'character',astrogate_view:id==='shot'?'':id,astrogate_base_prompt:id}})),
+        links:[...['front','left','shot'].map(to=>({from:'$board',slot:0,to,input:'board',type:'ASTROGATE_BOARD'})),
+            {from:'front',slot:0,to:'left',input:'reference_images.reference_1',type:'IMAGE'},
+            {from:'front',slot:0,to:'shot',input:'reference_images.reference_1',type:'IMAGE'},
+            {from:'left',slot:0,to:'shot',input:'reference_images.reference_2',type:'IMAGE'}]};
+    const calls=[];
+    const api={fetchApi:async(path,options)=>{
+        const body=options?.body?JSON.parse(options.body):null;
+        calls.push([path,body]);
+        const data=path.endsWith('/native/canvas')?recipe:path.endsWith('/native/prepare')?{id:'job-'+body.prompt,status:'prepared'}:{};
+        return {ok:true,json:async()=>data};
+    }};
+    const app={registerExtension(){},graph,nodeOutputs:{},canvas:{ds:{},centerOnNode(){},selectNode(){}},graphToPrompt:async()=>({output:{},workflow:{}})};
+    const {buildBoard}=await load(app,{LiteGraph,FormData:class{},crypto:{randomUUID:()=> 'auto-images'}},api);
+    const info={project_id:'project',chapter_id:'chapter-id',analysis_id:'analysis'};
+    await Promise.all([buildBoard(board,info),buildBoard(board,info)]);
+    assert.equal(calls.filter(([p])=>p.endsWith('/native/canvas')).length,1);
+    assert.equal(calls.filter(([p])=>p==='/prompt').length,1);
+    const prepared=calls.filter(([p])=>p.endsWith('/native/prepare')).map(([,b])=>b);
+    assert.deepEqual(prepared.map(b=>b.prompt),['front','left','shot']);
+    assert.equal(prepared[1].references[0].job_id,'job-front');
+    assert.equal(prepared[1].view,'left');
+    assert.equal(board.properties.astrogate_generation_jobs.length,3);
+    await buildBoard(board,info,true);
+    assert.equal(calls.filter(([p])=>p==='/prompt').length,1);
+    board.properties.astrogate_autogenerate=false;
+    await buildBoard(board,{...info,analysis_id:'another'});
+    assert.equal(calls.filter(([p])=>p==='/prompt').length,1);
+});
+
+test('global aspect changes scene frames while keeping character designs and old images',async()=>{
+    const {graph,LiteGraph,board}=analysisGraph();
+    board.widgets.push({name:'frame_aspect_ratio',value:'2.390：1'});
+    const frames=['character','scene','shot'].map(kind=>{
+        const n=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(n);
+        n.properties={astrogate_kind:kind,astrogate_images:[{filename:'old.png'}]};
+        n.widgets.find(w=>w.name==='aspect_ratio').value='2:3';
+        n.addInput('board','ASTROGATE_BOARD');board.connect(0,n,0);return n;
+    });
+    const calls=[];
+    const {applyFrameAspect}=await load({registerExtension(){},graph},{FormData:class{}},analysisAPI(calls,[]));
+    await applyFrameAspect(board);
+    assert.deepEqual(frames.map(n=>n.widgets.find(w=>w.name==='aspect_ratio').value),['2:3','2.39:1','2.39:1']);
+    assert.ok(frames.every(n=>n.properties.astrogate_images[0].filename==='old.png'));
+    assert.equal(JSON.parse(calls[0][1]).action,'frame_aspect_ratio');
+});
+
+test('image card controls precede a folded prompt and batch progress counts only saved images',async()=>{
+    const elements=[];
+    class Element {
+        constructor(tag){this.tag=tag;this.children=[];this.events={};this.classList={toggle(){}};elements.push(this);}
+        append(...items){this.children.push(...items);}
+        addEventListener(name,fn){this.events[name]=fn;}
+        getAttribute(name){return this[name];}
+        removeAttribute(name){delete this[name];}
+    }
+    const {graph,LiteGraph}=graphMock();graph.change=()=>{};
+    const node=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(node);
+    node.properties.astrogate_images=[{filename:'old.png',type:'output'}];
+    node.widgets.forEach(w=>{w.options={values:['16:9','4K','high']};});
+    node.widgets[0].value='保留提示词';
+    node.inputs=[{name:'reference_images.reference_1',link:11},{name:'reference_images.reference_2',link:22},{name:'board',link:33}];
+    node.addDOMWidget=()=>({options:{}});node.setSize=size=>node.size=size;node.computeSize=()=>[430,440];
+    const {installFrame,batchProgress}=await load({registerExtension(){},graph,nodeOutputs:{}},{document:{createElement:tag=>new Element(tag)}},{apiURL:path=>path});
+    installFrame(node);
+    const root=elements.find(e=>e.className==='ag-native ag-image-card');
+    const detail=elements.find(e=>e.tag==='details');
+    assert.equal(root.children[2].className,'ag-native-actions');
+    assert.equal(root.children[4],detail);
+    assert.match(root.children[0].textContent,/参考图 2/);
+    assert.equal(node.properties.astrogate_references_folded,true);
+    assert.equal(node.agStatus.hidden,true);
+    const inputs=node.inputs;
+    root.children[0].events.click();
+    assert.equal(node.properties.astrogate_references_folded,false);
+    assert.ok(node.inputs.every(i=>i.pos===undefined));
+    root.children[0].events.click();
+    assert.equal(node.inputs,inputs);
+    assert.deepEqual(node.inputs.map(i=>i.link),[11,22,33]);
+    assert.equal(detail.open,false);
+    assert.equal(node.agImage.hidden,false);
+    assert.equal(elements.find(e=>e.tag==='textarea').value,'保留提示词');
+    detail.open=true;detail.events.toggle();detail.open=false;detail.events.toggle();
+    assert.equal(node.widgets[0].value,'保留提示词');
+    assert.equal(node.agImage.hidden,false);
+    node.properties.astrogate_generation_jobs=['a','b','c','d'];
+    batchProgress(node,new Map([['a',{status:'succeeded'}],['b',{status:'running'}],['c',{status:'queued'}],['d',{status:'unknown'}]]));
+    assert.equal(node.agProgress.bar.value,1);assert.equal(node.agProgress.bar.max,4);
+    assert.match(node.agProgress.label.textContent,/已完成 1\/4.*未完成\/异常 1/);
 });

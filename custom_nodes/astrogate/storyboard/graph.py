@@ -31,6 +31,8 @@ def snapshot(project, shot):
     settings = {key: project["settings"][key] for key in ("aspect_ratio", "resolution", "quality", "style")}
     people = []
     for person in shot.get("participants", []):
+        if person.get("visible") is not True:
+            continue
         name = asset_by_id(project, person["identity"]["asset_id"])["name"]
         people.append(f"{name}：" + "，".join(str(person.get(k, "")) for k in ("screen_position", "action", "expression", "facing")))
     return {"shot": copy.deepcopy(shot), "references": refs, "missing": missing, "descriptions": descriptions,
@@ -51,7 +53,7 @@ def render_prompt(snap, refs):
         lines.append("参考图用途（按实际输入顺序）：")
         lines.extend(f"图{index + 1}：{ref['purpose']}" for index, ref in enumerate(refs))
         lines.append("每张图仅用于指定对象和用途，不混合不同人物的脸和服装。场景参考中的路人不自动入画。上一帧只参考空间关系，人物名单以本镜为准。")
-    lines.append("只画本镜列出的可见人物；默认无字幕、文字标签和水印。")
+    lines.append("只绘制指定的设定素材；默认无文字标签和水印。" if "asset_description" in snap["shot"] else "只画本镜列出的可见人物；默认无字幕、文字标签和水印。")
     prompt = "\n".join(lines)
     if len(prompt) > 16000:
         raise ValueError("合并素材说明后的提示词超过16000字符，请精简设定。")

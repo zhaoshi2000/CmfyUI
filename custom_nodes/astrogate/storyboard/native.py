@@ -3,7 +3,7 @@ import secrets
 
 from .analysis import analyse
 from .graph import render_prompt, snapshot
-from .store import asset_by_id, binding, digest, invalidate, shot_bindings, version
+from .store import aspect_ratio, asset_by_id, binding, digest, invalidate, shot_bindings, version
 
 
 async def analyse_native(store, project_id, chapter_number, model, style, density, revision):
@@ -36,8 +36,12 @@ def asset_shot(project, asset):
             "props": [binding(project, asset["parent_id"], "locked" if parent_version else "follow_latest", parent_version)] if asset.get("parent_id") else [], "source_refs": asset.get("source_refs", [])}
 
 
-def local_asset_job(store, project, asset, image):
+def local_asset_job(store, project, asset, image, view=None):
+    if view is None:
+        view = "front" if asset["kind"] == "character" else ""
     existing = next((j for j in store.jobs(project["id"]) if j.get("owner_id") == asset["id"] and j["status"] == "succeeded"
+                     and j.get("asset_version_id") == asset["current_version_id"]
+                     and j.get("asset_view", "front" if asset["kind"] == "character" else "") == view
                      and j.get("result_image", {}).get("hash") == image["hash"]), None)
     if existing:
         return existing
@@ -45,7 +49,7 @@ def local_asset_job(store, project, asset, image):
     snap = snapshot(project, shot)
     folder, filename = image["file"].rsplit("/", 1)
     return store.add_job(project["id"], {"kind": "image", "native": True, "status": "succeeded", "owner_type": "asset",
-                        "asset_version_id": asset["current_version_id"],
+                        "asset_version_id": asset["current_version_id"], "asset_view": view,
                         "owner_id": asset["id"], "prompt": shot["image_prompt"], "snapshot": snap, "settings": snap["settings"],
                         "references": [], "result_image": image, "saved_result": {"filename": filename, "subfolder": folder, "type": "input"}})
 
@@ -79,12 +83,13 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
     nodes, links = [], []
     colors = {"character": "#355168", "look": "#4d4268", "scene": "#385448", "scene_state": "#385448", "prop": "#635035", "shot": "#294d63"}
 
-    def add(owner, kind, prompt, position, job=None, key=None):
+    def add(owner, kind, prompt, position, job=None, key=None, view=""):
         key = key or owner["id"]
         if job and job["status"] == "succeeded":
             prompt = job["snapshot"]["shot"]["image_prompt"]
         props = {"astrogate_project": project["id"], "astrogate_owner": owner["id"], "astrogate_owner_type": "shot" if kind == "shot" else "asset",
-                 "astrogate_kind": kind, "astrogate_key": key, "astrogate_base_prompt": prompt,
+                 "astrogate_kind": kind, "astrogate_key": key, "astrogate_base_prompt": prompt, "astrogate_prompt_folded": True,
+                 "astrogate_view": view, "astrogate_layout_version": 2,
                  "astrogate_images": [job["saved_result"]] if job and job.get("saved_result") else []}
         parent = asset_by_id(project, owner.get("parent_id"))
         purpose = {"character": "人物身份、脸型体貌，不套用服装", "look": "此人物的服装、发型和配饰",
@@ -93,40 +98,62 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
         props["astrogate_reference_purpose"] = f"{parent['name'] + ' / ' if parent else ''}{owner.get('name', owner.get('summary', ''))}：{purpose}"
         if kind != "shot":
             props["astrogate_version"] = owner["current_version_id"]
-            props["astrogate_locked"] = key != owner["id"]
+            props["astrogate_locked"] = "@" in key
+        if view:
+            props["astrogate_reference_purpose"] += " · " + ("正面身份基准" if view == "front" else "同一人物的左侧轮廓，不是第二个人物")
         nodes.append({"id": key, "type": "AstroGateStoryboardFrame", "title": owner.get("summary", owner.get("name", "图片")),
                       "pos": position, "color": colors[kind], "properties": props,
                       "widgets": {"prompt": prompt, "job_id": job["id"] if job else "", "element_id": owner["id"],
-                                  "aspect_ratio": project["settings"]["aspect_ratio"], "resolution": "4K", "quality": "high"}})
+                                  "aspect_ratio": "2:3" if kind == "character" else project["settings"]["aspect_ratio"], "resolution": "4K", "quality": "high"}})
         if parent:
             nodes[-1]["title"] = f"{parent['name']} / {owner['name']}"
         links.append({"from": "$board", "slot": 0, "to": key, "input": "board", "type": "ASTROGATE_BOARD", "label": "所属分镜脚本"})
 
     positions = {}
     def place_asset(key, depth, row):
-        positions[key] = [900 + depth * 480, 80 + row * 650]
+        positions[key] = [520 + depth * 480, 80 + row * 620]
         children = [child for child in assets if parents.get(child) == key]
         if not children:
             return row + 1
         for child in children:
-            row = place_asset(child, depth + 1, row)
+            row = place_asset(child, depth + (2 if assets[key]["kind"] == "character" else 1), row)
         return row
 
     row = 0
     for root in [key for key in assets if key not in parents]:
         row = place_asset(root, 0, row)
-    shot_column = max(1940, max((pos[0] + 560 for pos in positions.values()), default=1940))
+    shot_column = max(1560, max((pos[0] + (1040 if assets[key]["kind"] == "character" else 560) for key, pos in positions.items()), default=1560))
     for key, asset in assets.items():
         parent = parents.get(key)
         selected = version(asset)
-        job = local_asset_job(store, project, asset, selected["image"]) if selected.get("image") else next(
+        view = "front" if asset["kind"] == "character" else ""
+        job = local_asset_job(store, project, asset, selected["image"], view) if selected.get("image") else next(
             (j for j in jobs if j.get("owner_id") == asset["id"] and j["status"] == "succeeded" and
+             j.get("asset_view", "") == view and
              (j.get("asset_version_id") == selected["id"] or j.get("snapshot", {}).get("shot", {}).get("asset_description") == selected["description"])), None)
-        add(asset, asset["kind"], selected["description"], positions[key], job, key)
+        prompt = selected["description"]
+        if view:
+            prompt = f"{asset['name']}的人物设计正视图。{prompt}\n单独一人，正对镜头，全身完整，双臂自然下垂，纯净背景。保持脸型、体型和年龄特征，不要多视图拼贴和文字。"
+        elif asset["kind"] in ("scene", "scene_state"):
+            prompt += "\n这是空场景空间参考图，不绘制人物；人物只在后续分镜帧中出现。"
+        add(asset, asset["kind"], prompt, positions[key], job, key, view)
         if key != asset["id"]:
             nodes[-1]["title"] += " · 固定版本"
         if parent:
             links.append({"from": parent, "slot": 0, "to": key, "input": "reference_images.reference_1", "type": "IMAGE", "label": "身份/场景基准"})
+        if view:
+            nodes[-1]["title"] += " · 正视"
+            left_key = key + "::left"
+            left_job = next((j for j in jobs if j.get("owner_id") == asset["id"] and j.get("asset_version_id") == selected["id"]
+                             and j.get("asset_view") == "left" and j["status"] == "succeeded"
+                             and job and any(r.get("job_id") == job["id"] for r in j.get("references", []))), None)
+            left_image = selected.get("view_images", {}).get("left")
+            if left_image:
+                left_job = local_asset_job(store, project, asset, left_image, "left")
+            prompt = f"根据参考正视图生成同一个{asset['name']}的左视图。{selected['description']}\n严格人物自身左侧90度侧面，全身完整，左耳可见，纯净背景。保持参考图的脸型、体型、服装、发型和配饰；只画同一个人，不拼贴、不加文字。"
+            add(asset, "character", prompt, [positions[key][0] + 480, positions[key][1]], left_job, left_key, "left")
+            nodes[-1]["title"] += " · 左视"
+            links.append({"from": key, "slot": 0, "to": left_key, "input": "reference_images.reference_1", "type": "IMAGE", "label": "正视图 → 同一人物左视图"})
 
     for index, shot in enumerate(shots):
         scene_id = (shot.get("scene") or {}).get("asset_id", "none")
@@ -139,6 +166,8 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
             key = include_asset(item["asset_id"], item["version_id"] if item["policy"] == "locked" else None)
             if key not in seen:
                 refs.append(key)
+                if assets[key]["kind"] == "character":
+                    refs.append(key + "::left")
                 seen.add(key)
         if shot.get("previous_shot_id"):
             refs.append(shot["previous_shot_id"])
@@ -170,10 +199,14 @@ def prepare_native(store, project, body):
         shot = asset_shot(project, asset)
     else:
         raise ValueError("节点归属类型无效。")
+    view = body.get("view", "front" if kind == "asset" and asset["kind"] == "character" else "")
+    if view not in (("front", "left") if kind == "asset" and asset["kind"] == "character" else ("",)):
+        raise ValueError("人物设计视图无效。")
     shot["image_prompt"] = body["prompt"]
-    if kind == "asset":
+    if kind == "asset" and not view:
         shot["asset_description"] = body["prompt"]
     settings = {**project["settings"], **body["settings"]}
+    settings["aspect_ratio"] = aspect_ratio(settings["aspect_ratio"])
     if settings["resolution"] not in ("original", "1K", "2K", "3K", "4K") or settings["quality"] not in ("low", "medium", "high"):
         raise ValueError("图片参数无效。")
     refs = []
@@ -187,6 +220,13 @@ def prepare_native(store, project, body):
                 raise ValueError("参考任务不属于本项目。")
             ref["job_id"] = source["id"]
             ref["asset_id"] = source["owner_id"]
+            source_asset = asset_by_id(project, source["owner_id"]) if source["owner_type"] == "asset" else None
+            if source_asset:
+                ref["asset_kind"] = source_asset["kind"]
+                if source_asset["kind"] in ("character", "look"):
+                    ref["character_id"] = source_asset["parent_id"] if source_asset["kind"] == "look" else source_asset["id"]
+            if source.get("asset_view"):
+                ref.update(asset_view=source["asset_view"], version_id=source["asset_version_id"])
         refs.append(ref)
     story_id = body.get("story_parent_id")
     story = next((s for s in project["shots"] if s["id"] == story_id), None)
@@ -196,9 +236,10 @@ def prepare_native(store, project, body):
     snap.update(settings=settings, story_parent_id=story_id, story_summary=story["summary"] if story else "")
     if story:
         snap["descriptions"].append(f"前情（只延续叙事，不自动画入前镜人物）：{story['summary']}")
-    fingerprint = digest([shot["image_prompt"], settings, refs, story_id, snap["story_summary"], snap["descriptions"], snap["people"]])
+    fingerprint = digest([shot["image_prompt"], settings, refs, story_id, snap["story_summary"], snap["descriptions"], snap["people"], view])
     asset_version = asset["current_version_id"] if kind == "asset" else None
-    jobs = [j for j in store.jobs(project["id"]) if j.get("owner_id") == owner_id and j.get("native") and j.get("asset_version_id") == asset_version]
+    jobs = [j for j in store.jobs(project["id"]) if j.get("owner_id") == owner_id and j.get("native") and j.get("asset_version_id") == asset_version
+            and j.get("asset_view", "front" if view else "") == view]
     active = next((j for j in jobs if j["status"] in ("running", "prepared", "queued", "cancelling")), None)
     if active:
         raise ValueError("该图片节点已经有任务，请等待或停止后再生成。")
@@ -216,6 +257,6 @@ def prepare_native(store, project, body):
                 invalidate(p, [owner_id])
         store.change(project["id"], edited)
     return store.add_job(project["id"], {"kind": "image", "native": True, "owner_type": kind, "owner_id": owner_id,
-                         "asset_version_id": asset_version,
+                         "asset_version_id": asset_version, "asset_view": view,
                          "snapshot": snap, "settings": settings, "prompt": render_prompt(snap, refs), "fingerprint": fingerprint,
                          "references": refs, "gateway_request_id": secrets.token_hex(32)})

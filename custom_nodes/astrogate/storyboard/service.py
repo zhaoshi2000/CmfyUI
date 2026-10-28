@@ -12,7 +12,7 @@ from server import PromptServer
 from .analysis import MODELS, analyse
 from .graph import draft_canvas, plan, prepare
 from .native import native_canvas, prepare_native
-from .store import Store, asset_by_id, invalidate, merge_asset, new_id, parse_novel, publish_version, validate_shot, version
+from .store import Store, aspect_ratio, asset_by_id, invalidate, merge_asset, new_id, parse_novel, publish_version, validate_shot, version
 
 
 _store = None
@@ -109,12 +109,16 @@ def register_routes():
 
         def change(p):
             action = body["action"]
-            if action == "settings":
+            if action == "frame_aspect_ratio":
+                ratio = aspect_ratio(body["aspect_ratio"])
+                if p["settings"]["aspect_ratio"] != ratio:
+                    p["settings"]["aspect_ratio"] = ratio
+                    invalidate(p, [s["id"] for s in p["shots"]])
+            elif action == "settings":
                 values = body["settings"]
                 if values["text_model"] not in MODELS:
                     raise ValueError("文本模型不在可选列表内。")
-                if values["aspect_ratio"] not in ("1:1", "16:9", "9:16", "4:3", "3:4", "2:3", "3:2", "21:9"):
-                    raise ValueError("画幅比例无效。")
+                values["aspect_ratio"] = aspect_ratio(values["aspect_ratio"])
                 if values["resolution"] not in ("original", "1K", "2K", "3K", "4K") or values["quality"] not in ("low", "medium", "high"):
                     raise ValueError("图片设置无效。")
                 if any(values[k] != p["settings"][k] for k in ("style", "aspect_ratio", "resolution", "quality")):
@@ -149,6 +153,20 @@ def register_routes():
                 if job["project_id"] != p["id"] or job.get("owner_type") != "asset" or job["status"] != "succeeded":
                     raise ValueError("该任务没有可定稿的素材图片。")
                 asset = asset_by_id(p, job["owner_id"])
+                if job.get("asset_view"):
+                    selected = version(asset, job["asset_version_id"])
+                    views = {}
+                    if job["asset_view"] == "front":
+                        views["front"] = job["result_image"]
+                        if version(asset).get("image") == views["front"]:
+                            views.update(version(asset).get("view_images", {}))
+                    else:
+                        front = next((r for r in job["references"] if r.get("asset_view") == "front" and r.get("asset_id") == asset["id"]), None)
+                        views["front"] = store.job(front["job_id"])["result_image"] if front else selected.get("image")
+                        views["left"] = job["result_image"]
+                    record = publish_version(p, asset["id"], selected["description"], views["front"])
+                    record["view_images"] = views
+                    return
                 parent = job["snapshot"]["shot"].get("props", [])
                 publish_version(p, asset["id"], job["snapshot"]["shot"]["asset_description"], job["result_image"],
                                 parent[0]["version_id"] if parent else None)

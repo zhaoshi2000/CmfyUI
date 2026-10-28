@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import hashlib
+import math
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
@@ -12,7 +13,7 @@ from pathlib import Path
 import aiohttp
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 import folder_paths
 from comfy_api.latest import ComfyExtension, io, ui
@@ -21,7 +22,7 @@ from server import PromptServer
 from .storyboard.graph import render_prompt, semantic_hash, snapshot
 from .storyboard.native import analyse_native
 from .storyboard.service import get_store, register_routes
-from .storyboard.store import image_hash, invalidate
+from .storyboard.store import aspect_ratio as normalize_aspect_ratio, image_hash, invalidate
 
 
 API_BASE = os.environ.get("ASTROGATE_IMG_API_BASE", "https://img.astrogate.sbs/internal/astrogate/v1").rstrip("/")
@@ -80,18 +81,22 @@ def read_api_key():
 
 
 def output_dimensions(aspect_ratio, resolution):
-    width, height = ASPECT_SIZES[aspect_ratio]
-    if resolution == "original":
+    ratio = normalize_aspect_ratio(aspect_ratio)
+    if ratio in ASPECT_SIZES:
+        width, height = ASPECT_SIZES[ratio]
+    else:
+        width, height = map(float, ratio.split(":"))
+    if resolution == "original" and ratio in ASPECT_SIZES:
         return width, height
-    edge = RESOLUTION_EDGES[resolution]
+    edge = 1536 if resolution == "original" else RESOLUTION_EDGES[resolution]
     if width >= height:
         return edge, max(2, round(edge * height / width / 2) * 2)
     return max(2, round(edge * width / height / 2) * 2), edge
 
 
-def encode_references(reference_images):
+def encode_references(reference_images, max_images=8):
     batches = [batch for batch in (reference_images or {}).values() if batch is not None]
-    if sum(batch.shape[0] for batch in batches) > 8:
+    if max_images is not None and sum(batch.shape[0] for batch in batches) > max_images:
         raise ValueError("AstroGate 最多支持 8 张参考图，包含输入批次中的所有图片。")
     images = []
     total_bytes = 0
@@ -108,6 +113,81 @@ def encode_references(reference_images):
                 raise ValueError("参考图单张不能超过 32 MB，合计不能超过 50 MB。")
             images.append({"b64_json": base64.b64encode(data).decode("ascii"), "filename": f"reference-{len(images) + 1}.png", "mime_type": "image/png"})
     return images
+
+
+def pack_character_views(images, refs):
+    packed, purposes, consumed = [], [], set()
+    for index, (image, ref) in enumerate(zip(images, refs)):
+        if index in consumed:
+            continue
+        pair = next((i for i, other in enumerate(refs) if i != index and i not in consumed
+                     and ref.get("asset_view") in ("front", "left") and other.get("asset_view") == ("left" if ref["asset_view"] == "front" else "front")
+                     and (ref.get("asset_id"), ref.get("version_id")) == (other.get("asset_id"), other.get("version_id"))), None)
+        if pair is None:
+            packed.append(image)
+            purposes.append(ref)
+            continue
+        front_index, left_index = (index, pair) if ref["asset_view"] == "front" else (pair, index)
+        with Image.open(BytesIO(base64.b64decode(images[front_index]["b64_json"]))) as front, Image.open(BytesIO(base64.b64decode(images[left_index]["b64_json"]))) as left:
+            sheet = Image.new("RGB", (front.width + left.width, max(front.height, left.height)), "white")
+            sheet.paste(front, (0, 0))
+            sheet.paste(left, (front.width, 0))
+            if sheet.width * sheet.height > 24_000_000:
+                scale = (24_000_000 / (sheet.width * sheet.height)) ** 0.5
+                sheet = sheet.resize((int(sheet.width * scale), int(sheet.height * scale)), Image.Resampling.LANCZOS)
+            buffer = BytesIO()
+            sheet.save(buffer, format="PNG")
+        packed.append({"b64_json": base64.b64encode(buffer.getvalue()).decode(), "filename": f"character-{index}.png", "mime_type": "image/png"})
+        purposes.append({**refs[front_index], "purpose": refs[front_index]["purpose"] + "；同一人物双视图图册：左半为正视，右半为左视，不能画成两个人。"})
+        consumed.add(pair)
+    groups = {}
+    for index, ref in enumerate(purposes):
+        if ref.get("character_id"):
+            groups.setdefault(ref["character_id"], []).append(index)
+    if len(packed) > 8:
+        props = [i for i, ref in enumerate(purposes) if ref.get("asset_kind") == "prop"]
+        if len(props) > 1:
+            groups["props"] = props
+    combined, bindings, consumed = [], [], set()
+    for index, (image, ref) in enumerate(zip(packed, purposes)):
+        if index in consumed:
+            continue
+        group = next((indices for indices in groups.values() if index in indices and len(indices) > 1), None)
+        if not group:
+            combined.append(image)
+            bindings.append(ref)
+            continue
+        sheet = reference_sheet([packed[i] for i in group])
+        label = "同一人物设定图册" if ref.get("character_id") else "道具参考图册"
+        purpose = label + "（按图上编号逐项参考，不能将图册排版画进分镜）：" + "；".join(f"{n+1}号：{purposes[i]['purpose']}" for n, i in enumerate(group))
+        combined.append(sheet)
+        bindings.append({**ref, "purpose": purpose})
+        consumed.update(group)
+    return combined, bindings
+
+
+def reference_sheet(images):
+    opened = []
+    for image in images:
+        with Image.open(BytesIO(base64.b64decode(image["b64_json"]))) as source:
+            opened.append(source.convert("RGB"))
+    columns = math.ceil(math.sqrt(len(opened)))
+    rows = math.ceil(len(opened) / columns)
+    width, height = max(im.width for im in opened), max(im.height for im in opened) + 64
+    scale = min(1, math.sqrt(24_000_000 / (columns * width * rows * height)))
+    width, height = int(width * scale), int(height * scale)
+    header = max(16, int(64 * scale))
+    sheet = Image.new("RGB", (columns * width, rows * height), "white")
+    draw = ImageDraw.Draw(sheet)
+    font = ImageFont.load_default(size=max(12, int(header * .7)))
+    for index, image in enumerate(opened):
+        image.thumbnail((width, height - header), Image.Resampling.LANCZOS)
+        x, y = (index % columns) * width, (index // columns) * height
+        sheet.paste(image, (x, y + header))
+        draw.text((x + 4, y), str(index + 1), fill="black", font=font)
+    buffer = BytesIO()
+    sheet.save(buffer, format="PNG")
+    return {"b64_json": base64.b64encode(buffer.getvalue()).decode(), "filename": "reference-atlas.png", "mime_type": "image/png"}
 
 
 async def generate_image(payload, edit):
@@ -243,9 +323,9 @@ class AstroGateStoryboardFrame(io.ComfyNode):
                     io.String.Input("job_id", display_name="任务 ID", default="", socketless=True),
                     io.Autogrow.Input("reference_images", optional=True,
                                       template=io.Autogrow.TemplateNames(io.Image.Input("reference", lazy=True),
-                                                                        names=[f"reference_{i}" for i in range(1, 9)], min=0)),
+                                                                        names=[f"reference_{i}" for i in range(1, 101)], min=0)),
                     io.String.Input("element_id", optional=True, default="", socketless=True),
-                    io.Combo.Input("aspect_ratio", display_name="画幅", optional=True, options=list(ASPECT_SIZES), default="16:9"),
+                    io.String.Input("aspect_ratio", display_name="画幅", optional=True, default="16:9"),
                     io.Combo.Input("resolution", display_name="分辨率", optional=True, options=["original", *RESOLUTION_EDGES], default="4K"),
                     io.Combo.Input("quality", display_name="质量", optional=True, options=["low", "medium", "high"], default="high"),
                     io.Custom("ASTROGATE_BOARD").Input("board", display_name="分镜脚本", optional=True, lazy=True, raw_link=True),
@@ -289,6 +369,8 @@ class AstroGateStoryboardFrame(io.ComfyNode):
                     raise ValueError("剧情连线已改变，请点击生成建立新的快照。")
             if job["status"] != "succeeded":
                 for key, value in (("aspect_ratio", aspect_ratio), ("resolution", resolution), ("quality", quality)):
+                    if key == "aspect_ratio" and value is not None:
+                        value = normalize_aspect_ratio(value)
                     if value is not None and value != job["settings"][key]:
                         raise ValueError("图片参数已改变，请点击生成建立新的任务。")
         if prompt not in (job["prompt"], job["snapshot"]["shot"]["image_prompt"]):
@@ -301,7 +383,7 @@ class AstroGateStoryboardFrame(io.ComfyNode):
         if job["status"] not in ("prepared", "queued"):
             raise RuntimeError("此任务不能重复发送。请查看任务状态；结果未知时不会自动重试。")
         ordered = dict(sorted((reference_images or {}).items(), key=lambda item: int(item[0].rsplit("_", 1)[1])))
-        references = encode_references(ordered)
+        references = encode_references(ordered, max_images=None if job.get("native") else 8)
         expected = job["references"]
         if job.get("native"):
             resolved = []
@@ -333,13 +415,18 @@ class AstroGateStoryboardFrame(io.ComfyNode):
                 elif image_hash(opened) != binding["image"]["hash"]:
                     raise ValueError("参考图顺序或内容与计划不符，请更新素材引用后重新生成。")
         settings = job["settings"]
+        request_refs = expected
+        if job.get("native"):
+            references, request_refs = pack_character_views(references, expected)
+        if len(references) > 8:
+            raise ValueError("人物双视图合并后仍超过接口的8张参考图限制，请减少本镜不必要的素材引用。")
         width, height = output_dimensions(settings["aspect_ratio"], settings["resolution"])
         payload = {"model": "gpt-image-2", "prompt": job["prompt"], "size": f"{width}x{height}", "quality": settings["quality"],
                    "n": 1, "stream": False, "response_format": "b64_json", "gateway_request_id": job["gateway_request_id"]}
         if references:
             payload["images"] = references
         if job.get("native"):
-            payload["prompt"] = render_prompt(job["snapshot"], expected)
+            payload["prompt"] = render_prompt(job["snapshot"], request_refs)
         read_api_key()
         request_path = store.root / "requests" / f"{job['id']}.json"
         request_path.parent.mkdir(exist_ok=True)
@@ -408,12 +495,18 @@ class AstroGateStoryboard(io.ComfyNode):
                                  io.Int.Input("chapter", display_name="章节序号", default=1, min=1),
                                  io.String.Input("style", display_name="画风设定", default="写实电影，自然摄影质感，所有人物和场景使用同一画风", multiline=True),
                                  io.String.Input("density", display_name="拆镜要求", default="精细拆镜，保留关键动作、对话反应、空间关系和必要空镜，每镜一张独立关键帧", multiline=True),
-                                 io.Int.Input("analysis_revision", display_name="重写编号", default=0, min=0)],
+                                 io.Int.Input("analysis_revision", display_name="重写编号", default=0, min=0),
+                                 io.String.Input("frame_aspect_ratio", display_name="统一画幅（宽:高）", optional=True, default="16:9")],
                          outputs=[io.Custom("ASTROGATE_BOARD").Output(display_name="分镜脚本"), io.String.Output(display_name="脚本 JSON")],
                          hidden=[io.Hidden.unique_id])
 
     @classmethod
-    async def execute(cls, script, text_model, chapter, style, density, analysis_revision=0):
+    async def execute(cls, script, text_model, chapter, style, density, analysis_revision=0, frame_aspect_ratio=None):
+        if frame_aspect_ratio is not None:
+            ratio = normalize_aspect_ratio(frame_aspect_ratio)
+            store = get_store()
+            if store.get(script["project_id"])["settings"]["aspect_ratio"] != ratio:
+                store.change(script["project_id"], lambda p: p["settings"].update(aspect_ratio=ratio))
         if cls.hidden.unique_id:
             PromptServer.instance.send_progress_text("AI 正在分析剧本、编写分镜与提示词…", cls.hidden.unique_id)
         board = await analyse_native(get_store(), script["project_id"], chapter, text_model, style, density, analysis_revision)

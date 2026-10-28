@@ -3,7 +3,6 @@ import { api } from "../../scripts/api.js";
 
 const base = "/astrogate/storyboard";
 const states = {prepared: "等待参考图 / 排队中", queued: "排队中", running: "正在生成", analysing: "正在分析剧本", succeeded: "已完成", failed: "失败", blocked: "本批次未执行", unknown: "结果未知 · 可明确重绘", cancelling: "正在停止", cancelled: "已取消"};
-const kinds = {character: "人物身份", look: "服装造型", scene: "场景", scene_state: "场景状态", prop: "道具", shot: "分镜"};
 const active = new Set(["prepared", "queued", "running", "analysing", "cancelling"]);
 let activityPanel;
 const value = (node, name) => node.widgets?.find(w => w.name === name)?.value;
@@ -27,6 +26,33 @@ function element(tag, text, className) {
     if (className) el.className = className;
     return el;
 }
+function progressBar(node) {
+    const root = element("div", undefined, "ag-progress");
+    const bar = element("progress");
+    bar.max = 1; bar.value = 0;
+    const label = element("div", "", "ag-hint");
+    root.append(bar, label);
+    root.hidden = true;
+    node.agProgress = {root, bar, label};
+    return root;
+}
+function showProgress(node, text, done = null, total = 1) {
+    if (!node.agProgress) return;
+    const {root, bar, label} = node.agProgress;
+    root.hidden = false;
+    label.textContent = text;
+    bar.max = total || 1;
+    if (done === null) bar.removeAttribute("value"); else bar.value = done;
+}
+function batchProgress(node, jobs) {
+    const batch = (node.properties.astrogate_generation_jobs || []).map(id => jobs.get(id)).filter(Boolean);
+    if (!batch.length) return;
+    const complete = batch.filter(j => j.status === "succeeded").length;
+    const running = batch.filter(j => j.status === "running").length;
+    const waiting = batch.filter(j => ["prepared", "queued"].includes(j.status)).length;
+    const failed = batch.length - complete - running - waiting;
+    showProgress(node, `已完成 ${complete}/${batch.length} 张 · 生成中 ${running} · 等待 ${waiting}${failed ? ` · 未完成/异常 ${failed}` : ""}`, complete, batch.length);
+}
 function message(node, text, busy = false, error = false) {
     const changed = node.properties.astrogate_status !== text || node.agBusy !== busy || node.agError !== error;
     node.properties.astrogate_status = text;
@@ -36,6 +62,7 @@ function message(node, text, busy = false, error = false) {
         node.agStatus.textContent = text;
         node.agStatus.classList.toggle("busy", busy);
         node.agStatus.classList.toggle("error", error);
+        if (node.type === "AstroGateStoryboardFrame") node.agStatus.hidden = !error;
     }
     if (node.type === "AstroGateStoryboard") {
         const preview = node.widgets?.find(w => w.name === "$$node-text-preview");
@@ -228,6 +255,7 @@ function labelReferences(node) {
         const source = sourceNode(node, input.name);
         input.label = `参考 ${input.name.split("_").at(-1)}${source ? " · " + source.title : ""}`;
     }
+    node.agRefreshReferences?.();
     node.setDirtyCanvas(true, true);
 }
 function restorePreview(node) {
@@ -274,6 +302,7 @@ function installFold(nodeType) {
 function mountGraph(board, recipe, relayout = false) {
     const mapping = new Map([["$board", board]]);
     const created = new Set();
+    const upgrade = new Set();
     for (const item of recipe.nodes) {
         let node = nodes().find(n => n.properties?.astrogate_key === item.id && n.properties?.astrogate_project === recipe.project_id);
         if (!node) {
@@ -284,7 +313,21 @@ function mountGraph(board, recipe, relayout = false) {
             for (const [key, input] of Object.entries(item.widgets)) setValue(node, key, input);
             node.properties.astrogate_base_settings = [value(node, "aspect_ratio"), value(node, "resolution"), value(node, "quality")];
             created.add(node);
-        } else if (relayout) node.pos = [board.pos[0] + item.pos[0], board.pos[1] + item.pos[1]];
+        } else if (relayout) {
+            node.pos = [board.pos[0] + item.pos[0], board.pos[1] + item.pos[1]];
+            if (item.properties.astrogate_layout_version && node.properties.astrogate_layout_version !== item.properties.astrogate_layout_version) {
+                const editable = value(node, "prompt") === node.properties.astrogate_base_prompt;
+                if (item.properties.astrogate_kind === "character" && !node.properties.astrogate_view) {
+                    if (editable) { setValue(node, "prompt", item.widgets.prompt); node.properties.astrogate_base_prompt = item.widgets.prompt; }
+                    setValue(node, "job_id", item.widgets.job_id);
+                }
+                for (const key of ["astrogate_view", "astrogate_layout_version", "astrogate_reference_purpose", "astrogate_prompt_folded"]) node.properties[key] = item.properties[key];
+                node.title = item.title;
+                if (editable && !value(node, "job_id")) { setValue(node, "prompt", item.widgets.prompt); node.properties.astrogate_base_prompt = item.widgets.prompt; }
+                if (item.properties.astrogate_kind === "character") setValue(node, "aspect_ratio", "2:3");
+                upgrade.add(node);
+            }
+        }
         node.properties.astrogate_chapter = recipe.chapter_id;
         node.agRefresh?.();
         restorePreview(node);
@@ -293,12 +336,12 @@ function mountGraph(board, recipe, relayout = false) {
     for (const link of recipe.links) {
         const target = mapping.get(link.to);
         // Restoring or arranging a chapter preserves manually edited wires and prompts.
-        if (created.has(target)) connect(mapping.get(link.from), link.slot, target, link.input, link.type);
+        if (created.has(target) || upgrade.has(target)) connect(mapping.get(link.from), link.slot, target, link.input, link.type);
     }
     for (const node of created) {
         labelReferences(node);
         node.properties.astrogate_signature = nodeSignature(node);
-        node.setSize?.([430, Math.max(590, node.computeSize?.()[1] || 0)]);
+        node.setSize?.([430, Math.max(440, node.computeSize?.()[1] || 0)]);
     }
     app.graph.setDirtyCanvas(true, true);
     return mapping;
@@ -308,13 +351,36 @@ async function saveBoard(board) {
     if (info) await request(`/projects/${info.project_id}/edit`, {action: "workflow", chapter_id: info.chapter_id, workflow: app.graph.serialize()});
 }
 async function buildBoard(board, info, relayout = false) {
-    board.properties.astrogate_board = info;
-    const recipe = await request(`/projects/${info.project_id}/native/canvas`, info);
-    const mapping = mountGraph(board, recipe, relayout);
-    const frames = [...mapping.values()].filter(n => n.properties.astrogate_kind === "shot");
-    message(board, `已建立 ${frames.length} 个分镜，人物与场景共享引用。点击卡片生成，或生成本章。`);
-    await saveBoard(board);
-    if (frames.length) focusNode(frames[0]);
+    if (board.agBuilding) return board.agBuilding;
+    board.agBuilding = (async () => {
+        board.properties.astrogate_board = info;
+        await applyFrameAspect(board);
+        const recipe = await request(`/projects/${info.project_id}/native/canvas`, info);
+        const mapping = mountGraph(board, recipe, relayout || board.properties.astrogate_layout_version !== 2);
+        board.properties.astrogate_layout_version = 2;
+        const frames = [...mapping.values()].filter(n => n.properties.astrogate_kind === "shot");
+        const auto = frames.length && board.properties.astrogate_autogenerate !== false && board.properties.astrogate_auto_started !== info.analysis_id;
+        if (auto) board.properties.astrogate_auto_started = info.analysis_id;
+        message(board, `已建立 ${frames.length} 个分镜与人物双视图。${auto ? "正在自动生成图片…" : "可生成本章或选中图片。"}`);
+        await saveBoard(board);
+        if (frames.length) focusNode([...mapping.values()].find(n => n.properties.astrogate_view === "front") || frames[0]);
+        if (auto) await generate(frames, false, board);
+    })();
+    try { return await board.agBuilding; }
+    finally { delete board.agBuilding; }
+}
+async function applyFrameAspect(board) {
+    let ratio = String(value(board, "frame_aspect_ratio") || "16:9").trim().replace("：", ":");
+    const parts = ratio.split(":").map(Number);
+    if (parts.length !== 2 || parts.some(v => !Number.isFinite(v) || v <= 0)) throw new Error("画幅请输入宽:高，例如 16:9 或 2.39:1。");
+    ratio = parts.join(":");
+    setValue(board, "frame_aspect_ratio", ratio);
+    const project = value(sourceNode(board, "script") || {}, "project_id") || board.properties.astrogate_board?.project_id;
+    if (project) await request(`/projects/${project}/edit`, {action: "frame_aspect_ratio", aspect_ratio: ratio});
+    for (const node of nodes().filter(n => n.type === "AstroGateStoryboardFrame" && sourceNode(n, "board") === board && n.properties.astrogate_kind !== "character")) {
+        setValue(node, "aspect_ratio", ratio);
+        node.agRefresh?.();
+    }
 }
 async function queueNodes(targets, jobs = [], graph = null) {
     graph ||= await app.graphToPrompt();
@@ -380,7 +446,7 @@ async function generate(targets, force = false, reporter = targets[0]) {
         }));
         message(node, `准备生成 · ${refs.length} 路图片参考`, true);
         const job = await request(`/projects/${project}/native/prepare`, {owner_id: node.properties.astrogate_owner,
-            version_id: node.properties.astrogate_version,
+            version_id: node.properties.astrogate_version, view: node.properties.astrogate_view,
             owner_type: node.properties.astrogate_owner_type || "shot", prompt: value(node, "prompt"),
             settings: {aspect_ratio: value(node, "aspect_ratio"), resolution: value(node, "resolution"), quality: value(node, "quality")},
             references: refs, story_parent_id: sourceNode(node, "story_context")?.properties.astrogate_owner || null, force: requested && force,
@@ -395,12 +461,15 @@ async function generate(targets, force = false, reporter = targets[0]) {
         message(node, states[job.status], active.has(job.status));
     }
     try {
+        for (const board of new Set(targets.map(n => sourceNode(n, "board")).filter(Boolean))) await applyFrameAspect(board);
         for (const node of targets) await visit(node, true);
         const count = prepared.filter(j => j.status !== "succeeded").length;
         message(reporter, `本次 ${count} 张新图 · ${Math.max(0, visited.size - count)} 张复用 · 按 IMAGE 连线执行`, true);
         const graph = await app.graphToPrompt();
         submitted = true;
         await queueNodes(targets, prepared, graph);
+        const batch = [...visited].map(id => value(app.graph.getNodeById(id), "job_id")).filter(Boolean);
+        for (const board of new Set([reporter, ...targets.map(n => sourceNode(n, "board"))].filter(n => n?.type === "AstroGateStoryboard"))) board.properties.astrogate_generation_jobs = batch;
         for (const board of nodes().filter(n => n.type === "AstroGateStoryboard" && n.properties.astrogate_board)) await saveBoard(board);
     } catch (error) {
         if (!submitted) for (const job of prepared) if (job.status !== "succeeded") await request(`/jobs/${job.id}/cancel`, {});
@@ -480,6 +549,7 @@ function showAnalysisState(node, job) {
         const stage = job.stage === "shots" ? "正在编写分镜与提示词" : job.stage === "assets" ? "正在提取人物、场景与道具" : "正在分析";
         const elapsed = job.stage_started_at ? ` · 已等待 ${Math.max(0, Math.floor(Date.now() / 1000 - job.stage_started_at))} 秒` : "";
         message(node, `${job.status === "cancelling" ? "正在停止" : stage} · ${job.completed_chunks || 0}/${job.total_chunks || "?"} 个正文块完成${elapsed}`, true);
+        showProgress(node, `${stage}${elapsed}`);
     }
     else if (job.status === "succeeded") message(node, "分镜分析已完成，人物、场景与镜头节点已建立。");
 }
@@ -505,7 +575,22 @@ async function startAnalysis(node, retry = false) {
 }
 function installBoard(node) {
     const root = element("div", undefined, "ag-native");
-    panelWidget(node, root, () => 195);
+    panelWidget(node, root, () => 265);
+    const ratio = node.widgets.find(w => w.name === "frame_aspect_ratio");
+    if (ratio) {
+        const previous = ratio.callback;
+        ratio.callback = function () {
+            previous?.apply(this, arguments);
+            applyFrameAspect(node).then(() => saveBoard(node)).catch(error => message(node, error.message, false, true));
+        };
+    }
+    const autoLabel = element("label", undefined, "ag-auto-generate");
+    const auto = element("input");
+    auto.type = "checkbox";
+    auto.checked = node.properties.astrogate_autogenerate !== false;
+    auto.addEventListener("change", () => { node.properties.astrogate_autogenerate = auto.checked; app.graph.change(); });
+    autoLabel.append(auto, element("span", "建好节点后自动生成图片"));
+    node.agRefresh = () => { auto.checked = node.properties.astrogate_autogenerate !== false; };
     const controls = element("div", undefined, "ag-native-actions");
     node.agAnalysisButton = button(node, "分析并自动建立节点", () => startAnalysis(node), "primary");
     node.agRetryButton = button(node, "重试未完成分析", () => startAnalysis(node, true));
@@ -537,13 +622,63 @@ function installBoard(node) {
         a.download = "astrogate-storyboard.zip";
         a.click();
     }));
-    root.append(controls, element("p", "terra 使用极高 xhigh；图片默认 high / 4K。剧情线不触发前镜重画。", "ag-hint"), node.agStatus);
-    node.size = [410, 560];
+    root.append(autoLabel, controls, progressBar(node), element("p", "人物正视 → 左视 → 实际出场分镜。人物设计 2:3，其余使用上方统一画幅；图片 high / 4K。", "ag-hint"), node.agStatus);
+    node.size = [430, 650];
 }
 function installFrame(node) {
+    node.properties.astrogate_prompt_folded ??= true;
+    node.properties.astrogate_references_folded ??= true;
     for (const w of node.widgets) if (["prompt", "job_id", "element_id", "aspect_ratio", "resolution", "quality"].includes(w.name)) w.hidden = true;
     node.hideOutputImages = true;
     const root = element("div", undefined, "ag-native ag-image-card");
+    const computeSize = node.computeSize;
+    node.computeSize = function () {
+        const size = computeSize.apply(this, arguments);
+        if (this.properties.astrogate_references_folded) size[1] = this.properties.astrogate_prompt_folded ? 560 : 730;
+        return size;
+    };
+    const referenceToggle = element("button", "", "ag-reference-toggle");
+    referenceToggle.type = "button";
+    referenceToggle.title = "展开后可查看、增删参考连线；收起保留所有连接";
+    node.agRefreshReferences = () => {
+        const folded = node.properties.astrogate_references_folded;
+        const count = (node.inputs || []).filter(input => input.name.startsWith("reference_images.") && input.link != null).length;
+        referenceToggle.textContent = `${folded ? "▸" : "▾"} 参考图 ${count} · ${folded ? "展开连接" : "收起连接"}`;
+        for (const input of node.inputs || []) {
+            if (folded) input.pos = [10, 14]; else delete input.pos;
+        }
+        if (folded) node.widgets_start_y = 44; else delete node.widgets_start_y;
+        node.setSize([node.size[0], Math.max(node.computeSize()[1], node.properties.astrogate_prompt_folded ? 560 : 730)]);
+        node.setDirtyCanvas(true, true);
+    };
+    const drawSlots = node.drawSlots;
+    node.drawSlots = function (ctx, options) {
+        if (!this.properties.astrogate_references_folded) return drawSlots?.call(this, ctx, options);
+        ctx.save();
+        ctx.globalAlpha = options.editorAlpha ?? 1;
+        ctx.font = this.innerFontStyle;
+        ctx.textAlign = "right";
+        for (const [index, output] of (this.outputs || []).entries()) {
+            const pos = this.getOutputPos(index);
+            const x = pos[0] - this.pos[0], y = pos[1] - this.pos[1];
+            ctx.fillStyle = output.type === "IMAGE" ? "#68ccff" : "#a39ab6";
+            ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = "#cbd2d9";
+            ctx.fillText(output.label || output.localized_name || output.name, x - 8, y + 4);
+        }
+        ctx.fillStyle = "#68ccff";
+        ctx.beginPath(); ctx.arc(10, 14, 4, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+    };
+    const getSlotInPosition = node.getSlotInPosition;
+    node.getSlotInPosition = function () {
+        const slot = getSlotInPosition?.apply(this, arguments);
+        return this.properties.astrogate_references_folded && slot?.input ? null : slot;
+    };
+    referenceToggle.addEventListener("click", () => {
+        node.properties.astrogate_references_folded = !node.properties.astrogate_references_folded;
+        node.agRefreshReferences(); app.graph.change();
+    });
     const stage = element("div", undefined, "ag-image-stage");
     const image = element("img");
     image.alt = "当前图片结果";
@@ -563,8 +698,9 @@ function installFrame(node) {
     const selects = [];
     for (const [name, label] of [["aspect_ratio", "画幅"], ["resolution", "分辨率"], ["quality", "质量"]]) {
         const w = node.widgets.find(w => w.name === name);
-        const select = element("select");
-        for (const option of w.options.values) { const item = element("option", option); item.value = option; select.append(item); }
+        const select = element(name === "aspect_ratio" ? "input" : "select");
+        if (name === "aspect_ratio") select.placeholder = "宽:高，例如 2:3";
+        else for (const option of w.options.values) { const item = element("option", option); item.value = option; select.append(item); }
         select.value = w.value;
         select.addEventListener("change", () => { w.value = select.value; app.graph.change(); });
         selects.push([select, w]);
@@ -575,10 +711,11 @@ function installFrame(node) {
     detail.append(summary, prompt, parameters);
     detail.addEventListener("toggle", () => {
         node.properties.astrogate_prompt_folded = !detail.open;
-        node.setSize([node.size[0], Math.max(node.computeSize()[1], detail.open ? 590 : 410)]);
+        node.setSize([node.size[0], Math.max(node.computeSize()[1], detail.open ? 730 : 560)]);
         node.setDirtyCanvas(true, true);
     });
-    panelWidget(node, root, () => detail.open ? 455 : 280);
+    panelWidget(node, root, () => detail.open ? 665 : 500);
+    node.agStatus.hidden = true;
     const controls = element("div", undefined, "ag-native-actions");
     controls.append(button(node, "生成图像", () => generate([node]), "primary"), button(node, "重绘", () => generate([node], true)),
         button(node, "停止", async () => {
@@ -590,18 +727,19 @@ function installFrame(node) {
         message(node, "素材已定稿，其他章节可以复用。");
     });
     controls.append(approve);
-    const binding = element("div", "", "ag-hint");
-    root.append(stage, detail, controls, binding, node.agStatus);
+    root.append(referenceToggle, stage, controls, progressBar(node), detail, node.agStatus);
     node.agRefresh = () => {
         prompt.value = value(node, "prompt") || "";
         for (const [select, w] of selects) select.value = w.value;
         detail.open = !node.properties.astrogate_prompt_folded;
+        const ratio = selects.find(([, w]) => w.name === "aspect_ratio")[0];
+        ratio.disabled = node.properties.astrogate_kind !== "character" && Boolean(sourceNode(node, "board"));
+        ratio.title = ratio.disabled ? "在所连的 AI 分镜脚本节点统一设置画幅" : "人物设计图独立画幅";
         approve.hidden = node.properties.astrogate_owner_type !== "asset";
-        const kind = kinds[node.properties.astrogate_kind] || "图片";
-        binding.textContent = `${kind}${node.properties.astrogate_locked ? " · 固定版本" : ""} · IMAGE 接口用于参考图，剧情接口只传前情。`;
+        node.agRefreshReferences();
         restorePreview(node);
     };
-    node.size = [430, 590];
+    node.size = [430, 560];
     node.agRefresh();
 }
 async function poll() {
@@ -619,6 +757,7 @@ async function poll() {
                 if (!job) continue;
                 activityEntries.push({node, job});
                 message(node, (states[job.status] || job.status) + (job.error ? ` · ${job.error}` : ""), active.has(job.status), ["failed", "unknown", "blocked"].includes(job.status));
+                showProgress(node, states[job.status] || job.status, job.status === "succeeded" ? 1 : active.has(job.status) ? null : 0);
                 if (job.saved_result) { node.properties.astrogate_images = [job.saved_result]; restorePreview(node); }
             }
             for (const node of boards.filter(n => value(sourceNode(n, "script") || {}, "project_id") === project)) {
@@ -630,7 +769,8 @@ async function poll() {
                     if (!job) message(node, "就绪，点击“分析并自动建立节点”开始。");
                 }
                 showAnalysisState(node, job);
-                if (job?.status === "succeeded" && node.properties.astrogate_board?.analysis_id !== job.id) {
+                batchProgress(node, jobs);
+                if (job?.status === "succeeded" && (node.properties.astrogate_board?.analysis_id !== job.id || node.properties.astrogate_layout_version !== 2)) {
                     delete node.properties.astrogate_resume_job;
                     await buildBoard(node, {project_id: project, chapter_id: job.chapter_id, analysis_id: job.id});
                 }

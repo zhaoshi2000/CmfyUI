@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import time
@@ -22,6 +23,17 @@ def digest(value):
 def image_hash(image):
     image = image.convert("RGB")
     return hashlib.sha256(str(image.size).encode() + image.tobytes()).hexdigest()
+
+
+def aspect_ratio(value):
+    parts = str(value).strip().replace("：", ":").split(":")
+    try:
+        width, height = map(float, parts)
+    except ValueError:
+        raise ValueError("画幅请输入宽:高，例如 16:9、9:16 或 2.39:1。") from None
+    if not all(math.isfinite(v) and v > 0 for v in (width, height)):
+        raise ValueError("画幅的宽和高必须是正数。")
+    return f"{width:g}:{height:g}"
 
 
 def decode_novel(data):
