@@ -46,22 +46,25 @@ VIEW_PROMPTS = {
 
 
 class FrameQueue:
-    def __init__(self):
-        self.lock = None
+    def __init__(self, limit=None):
+        self.limit = int(os.environ.get("ASTROGATE_IMG_CONCURRENCY", "4")) if limit is None else limit
+        if self.limit < 1:
+            raise ValueError("ASTROGATE_IMG_CONCURRENCY 必须是正整数。")
+        self.semaphore = None
         self.waiters = 0
 
     @asynccontextmanager
     async def slot(self):
-        if self.lock is None:
-            self.lock = asyncio.Lock()
+        if self.semaphore is None:
+            self.semaphore = asyncio.BoundedSemaphore(self.limit)
         self.waiters += 1
         try:
-            async with self.lock:
+            async with self.semaphore:
                 yield
         finally:
             self.waiters -= 1
             if not self.waiters:
-                self.lock = None
+                self.semaphore = None
 
 
 frame_queue = FrameQueue()

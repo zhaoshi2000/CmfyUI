@@ -95,7 +95,9 @@ function createActivityPanel() {
         const entry = current();
         const headline = busy[0] || entry;
         const state = headline ? activityStatus(headline.job) : "就绪";
-        title.textContent = `分镜日志 · ${connectionError ? "状态连接中断" : state}`;
+        const generating = entries.filter(entry => entry.job.kind === "image" && entry.job.status === "running").length;
+        const waiting = entries.filter(entry => entry.job.kind === "image" && ["prepared", "queued"].includes(entry.job.status)).length;
+        title.textContent = `分镜日志 · ${connectionError ? "状态连接中断" : generating ? `${generating} 张生成中${waiting ? ` · ${waiting} 张等待` : ""}` : state}`;
         summary.title = title.textContent;
         root.classList.toggle("busy", busy.length > 0 && !connectionError);
         root.classList.toggle("error", Boolean(connectionError || entry?.job.error));

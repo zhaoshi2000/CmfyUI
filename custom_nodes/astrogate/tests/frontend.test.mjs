@@ -266,6 +266,9 @@ test('compact log panel keeps logs when collapsed and cancels only the selected 
     assert.deepEqual(calls,['/astrogate/storyboard/jobs/job-b/cancel']);
     assert.equal(stop.disabled,true);
     assert.equal(a.job.status,'analysing');
+    panel.update([1,2,3,4].map(id=>({node:{id,title:'图片 '+id},job:{id:'image-'+id,kind:'image',status:id<4?'running':'queued',created_at:1}})));
+    assert.ok(elements.some(e=>e.textContent==='分镜日志 · 3 张生成中 · 1 张等待'));
+    assert.equal(stop.textContent,'停止此批次');
     panel.update([]);
     assert.match(log.textContent,/选择 TXT/);
 });

@@ -408,8 +408,9 @@ async def test_invalid_draft_reference_finishes_with_failure(modules, project):
     assert "原文定位" in modules.store.job(job["id"])["error"]
 
 
-async def test_frame_queue_serializes_requests_and_releases_loop(modules):
-    queue = modules.node.FrameQueue()
+@pytest.mark.parametrize("limit", [1, 3])
+async def test_frame_queue_limits_concurrency_and_releases_loop(modules, limit):
+    queue = modules.node.FrameQueue(limit)
     running = 0
     peak = 0
     async def work():
@@ -419,9 +420,28 @@ async def test_frame_queue_serializes_requests_and_releases_loop(modules):
             peak = max(peak, running)
             await asyncio.sleep(0.01)
             running -= 1
-    await asyncio.gather(work(), work(), work())
-    assert peak == 1
-    assert queue.lock is None and queue.waiters == 0
+    await asyncio.gather(*(work() for _ in range(6)))
+    assert peak == limit
+    assert queue.semaphore is None and queue.waiters == 0
+
+
+async def test_frame_queue_cancellation_releases_waiting_and_active_slots(modules):
+    queue = modules.node.FrameQueue(1)
+    entered = asyncio.Event()
+    async def work():
+        async with queue.slot():
+            entered.set()
+            await asyncio.Event().wait()
+    running = asyncio.create_task(work())
+    await entered.wait()
+    waiting = asyncio.create_task(work())
+    await asyncio.sleep(0)
+    waiting.cancel()
+    running.cancel()
+    await asyncio.gather(waiting, running, return_exceptions=True)
+    assert queue.semaphore is None and queue.waiters == 0
+    async with queue.slot():
+        assert queue.waiters == 1
 
 
 def test_merging_aliases_preserves_locked_versions(modules, project):
@@ -582,6 +602,59 @@ async def test_real_executor_resolves_image_but_not_story_or_analysis(modules, p
     assert executor.success, events
     assert len(requests) == 1
     assert set(executor.history_result['outputs']) == ({'4','5'} if has_reference else {'4'})
+
+async def test_native_executor_parallel_images_wait_for_their_references(modules, project, monkeypatch, tmp_path):
+    m = modules.node
+    native = sys.modules[m.__name__ + '.storyboard.native']
+    project['shots'] = [{**copy.deepcopy(project['shots'][0]), 'id':name} for name in ('a', 'b', 'c', 'target')]
+    modules.store.change(project['id'], lambda p: p.update(shots=project['shots']))
+    jobs, prompt = {}, {}
+    for name in ('a', 'b', 'c', 'target'):
+        refs = [{'slot':f'reference_images.reference_{i}', 'purpose':parent, 'job_id':jobs[parent]['id']}
+                for i, parent in enumerate(('a', 'b'), 1)] if name == 'target' else []
+        jobs[name] = native.prepare_native(modules.store, project, {'owner_id':name, 'owner_type':'shot',
+            'prompt':name, 'settings':{'resolution':'original', 'quality':'high'}, 'references':refs})
+        inputs = {'prompt':name, 'job_id':jobs[name]['id'], 'element_id':name}
+        if name == 'target':
+            inputs.update({'reference_images.reference_1':['a',0], 'reference_images.reference_2':['b',0]})
+        prompt[name] = {'class_type':'AstroGateStoryboardFrame', 'inputs':inputs}
+    all_started = asyncio.Event()
+    running, peak = 0, 0
+    finished = set()
+    names = {job['gateway_request_id']:name for name, job in jobs.items()}
+    async def generate(payload, edit):
+        nonlocal running, peak
+        name = names[payload['gateway_request_id']]
+        if name == 'target':
+            assert {'a','b'} <= finished
+            assert edit and len(payload['images']) == 2
+        running += 1
+        peak = max(peak, running)
+        if running == 2:
+            all_started.set()
+        await asyncio.wait_for(all_started.wait(), 2)
+        await asyncio.sleep(0.01)
+        data = BytesIO()
+        Image.new('RGB', (16,9), 'blue').save(data, format='PNG')
+        running -= 1
+        finished.add(name)
+        return {'data':[{'b64_json':m.base64.b64encode(data.getvalue()).decode()}]}
+    monkeypatch.setattr(m, 'frame_queue', m.FrameQueue(2))
+    monkeypatch.setattr(m, 'generate_image', generate)
+    monkeypatch.setattr(m, 'PromptServer', SimpleNamespace(instance=SimpleNamespace(send_progress_text=lambda *args: None)))
+    monkeypatch.setattr(m.folder_paths, 'output_directory', str(tmp_path / 'output'))
+    (tmp_path / 'output').mkdir()
+    m.AstroGateStoryboardFrame.FINALIZE_SCHEMA()
+    monkeypatch.setitem(nodes.NODE_CLASS_MAPPINGS, 'AstroGateStoryboardFrame', m.AstroGateStoryboardFrame)
+    events = []
+    server = SimpleNamespace(client_id=None, last_node_id=None, send_sync=lambda event,data,*args:events.append((event,data)))
+    executor = PromptExecutor(server, cache_args={'ram':0,'ram_inactive':0})
+    await executor.execute_async(prompt, 'parallel-images', {'client_id':'test'}, ['a','b','c','target'])
+    assert executor.success, events
+    assert peak == 2 and finished == {'a','b','c','target'}
+    assert all(modules.store.job(job['id'])['status'] == 'succeeded' for job in jobs.values())
+    assert len({modules.store.job(job['id'])['result_image']['file'] for job in jobs.values()}) == 4
+
 
 def test_native_locked_look_keeps_its_own_image_node(modules, project):
     native = sys.modules[modules.node.__name__ + '.storyboard.native']
