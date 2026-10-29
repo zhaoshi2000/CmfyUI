@@ -442,6 +442,11 @@ class AstroGateStoryboardFrame(io.ComfyNode):
         if element_id and element_id != job["owner_id"]:
             raise ValueError("任务与图片节点不匹配，请重新生成。")
         story_output = {"project_id": job["project_id"], "element_id": job["owner_id"], "summary": job["snapshot"]["shot"].get("summary", "")}
+        if job["status"] == "succeeded":
+            with Image.open(store.image_path(job["result_image"]["file"])) as opened:
+                image = torch.from_numpy(np.array(opened.convert("RGB"), dtype=np.float32) / 255).unsqueeze(0)
+            saved = job["saved_result"]
+            return io.NodeOutput(image, story_output, ui=ui.SavedImages([ui.SavedResult(saved["filename"], saved["subfolder"], io.FolderType(saved["type"]))]))
         if job.get("native"):
             graph = cls.hidden.prompt or {}
             if board:
@@ -453,19 +458,13 @@ class AstroGateStoryboardFrame(io.ComfyNode):
                 previous_id = graph[story_context[0]]["inputs"].get("element_id")
                 if previous_id != job["snapshot"].get("story_parent_id"):
                     raise ValueError("剧情连线已改变，请点击生成建立新的快照。")
-            if job["status"] != "succeeded":
-                for key, value in (("aspect_ratio", aspect_ratio), ("resolution", resolution), ("quality", quality)):
-                    if key == "aspect_ratio" and value is not None:
-                        value = normalize_aspect_ratio(value)
-                    if value is not None and value != job["settings"][key]:
-                        raise ValueError("图片参数已改变，请点击生成建立新的任务。")
+            for key, value in (("aspect_ratio", aspect_ratio), ("resolution", resolution), ("quality", quality)):
+                if key == "aspect_ratio" and value is not None:
+                    value = normalize_aspect_ratio(value)
+                if value is not None and value != job["settings"][key]:
+                    raise ValueError("图片参数已改变，请点击生成建立新的任务。")
         if prompt not in (job["prompt"], job["snapshot"]["shot"]["image_prompt"]):
             raise ValueError("提示词已修改，请点击卡片上的生成按钮建立新任务。")
-        if job["status"] == "succeeded":
-            with Image.open(store.image_path(job["result_image"]["file"])) as opened:
-                image = torch.from_numpy(np.array(opened.convert("RGB"), dtype=np.float32) / 255).unsqueeze(0)
-            saved = job["saved_result"]
-            return io.NodeOutput(image, story_output, ui=ui.SavedImages([ui.SavedResult(saved["filename"], saved["subfolder"], io.FolderType(saved["type"]))]))
         if job["status"] not in ("prepared", "queued"):
             raise RuntimeError("此任务不能重复发送。请查看任务状态；结果未知时不会自动重试。")
         ordered = dict(sorted((reference_images or {}).items(), key=lambda item: int(item[0].rsplit("_", 1)[1])))

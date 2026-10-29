@@ -587,6 +587,45 @@ def test_character_and_look_requests_require_clean_background_without_affecting_
     assert all('人物设定参考图：' not in job['prompt'] for job in jobs[3:])
 
 
+async def test_prop_request_keeps_story_context_but_only_draws_the_object(modules, project, monkeypatch, tmp_path):
+    native = sys.modules[modules.node.__name__ + '.storyboard.native']
+    description = '一盏点燃的铜制油灯，初始置于窗边木桌上；后文位于林夏与周野之间。'
+    prop = {'id': '油灯', 'name': '铜制油灯', 'kind': 'prop', 'parent_id': None, 'aliases': [],
+            'source_refs': project['shots'][0]['source_refs'], 'current_version_id': '油灯1',
+            'versions': [{'id': '油灯1', 'description': description, 'image': None}]}
+    project['assets'].append(prop)
+    modules.store.change(project['id'], lambda p: p['assets'].append(copy.deepcopy(prop)))
+    planned = modules.graph.plan(modules.store, project, [], asset_id='油灯', allow_missing=True)
+    assert '独立物品设定参考图：' in planned['entries'][0]['prompt']
+    job = native.prepare_native(modules.store, project, {'owner_id': '油灯', 'owner_type': 'asset',
+        'prompt': description, 'settings': {'resolution': 'original'}})
+    modules.store.update_job(job['id'], prompt=description)
+    sent = []
+
+    async def generate(payload, edit):
+        sent.append(payload)
+        data = BytesIO()
+        Image.new('RGB', (16, 16), 'white').save(data, format='PNG')
+        return {'data': [{'b64_json': modules.node.base64.b64encode(data.getvalue()).decode()}]}
+
+    monkeypatch.setattr(modules.node, 'generate_image', generate)
+    monkeypatch.setattr(modules.node.folder_paths, 'output_directory', str(tmp_path / 'output'))
+    (tmp_path / 'output').mkdir()
+    await modules.node.AstroGateStoryboardFrame.execute(description, job['id'], element_id='油灯')
+    actual = sent[0]['prompt']
+    assert actual.splitlines()[0] == '绘制任务：生成「铜制油灯」的单幅独立物品参考图，空背景。'
+    assert '不是场景绘制指令' in actual
+    assert description in actual
+    assert '干净的纯白或浅灰单色' in actual and '无人物、手部、家具、场景、无关物品' in actual
+    assert '不拼贴、不分屏' in actual and '前后剧情只用于理解物品，不画入画面' in actual
+    assert modules.store.get(project['id'])['assets'][-1]['versions'][0]['description'] == description
+    shot = copy.deepcopy(project['shots'][0])
+    shot['props'] = [modules.domain.binding(project, '油灯')]
+    frame = modules.graph.render_prompt(modules.graph.snapshot(project, shot), [])
+    assert description in frame and '林夏' in frame and '周野' in frame
+    assert '独立物品设定参考图：' not in frame
+
+
 def test_front_and_left_jobs_do_not_conflict_or_reuse_each_other(modules, project):
     native = sys.modules[modules.node.__name__ + '.storyboard.native']
     body = {'owner_id':'林夏','owner_type':'asset','prompt':'正视','settings':{'aspect_ratio':'2:3'},'view':'front'}

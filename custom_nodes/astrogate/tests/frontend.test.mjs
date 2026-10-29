@@ -69,6 +69,9 @@ test("native board creates real image/story wires, shares assets and preserves m
     assert.equal(getLink(second, "story_context").origin_slot, 1);
     assert.equal(changed(second), false);
     asset.widgets[0].value = "修改身份";
+    assert.equal(changed(first), false);
+    assert.equal(changed(second), false);
+    asset.widgets[1].value = "regenerated-asset";
     assert.equal(changed(first), true);
     assert.equal(changed(second), true);
     first.widgets[0].value = "手动改词"; first.pos = [900, 420];
@@ -144,6 +147,68 @@ test("story edges never prepare or regenerate the preceding image", async () => 
     assert.deepEqual(prepared.references, []);
     const queued = JSON.parse(calls.find(([p]) => p === "/prompt")[1]);
     assert.deepEqual(queued.partial_execution_targets, [String(target.id)]);
+});
+
+test("regenerating a later frame reuses saved predecessors even when their controls were edited", async () => {
+    const {graph, LiteGraph} = graphMock();
+    const make = (name, job) => {
+        const node = LiteGraph.createNode("AstroGateStoryboardFrame"); graph.add(node);
+        node.title = name; node.widgets[0].value = name; node.widgets[1].value = job;
+        node.properties = {astrogate_project: "p", astrogate_owner: name, astrogate_base_prompt: name,
+            astrogate_images: [{filename: name + ".png"}]};
+        return node;
+    };
+    const missing = make("old-source", "unknown-job"), previous = make("previous", "previous-job");
+    const target = make("target", "target-job"), later = make("later", "later-job");
+    previous.addInput("reference_images.reference_1", "IMAGE"); missing.connect(0, previous, 0);
+    target.addInput("reference_images.reference_1", "IMAGE"); previous.connect(0, target, 0);
+    later.addInput("reference_images.reference_1", "IMAGE"); target.connect(0, later, 0);
+    previous.widgets[0].value = "修改前图提示词，但还没有重绘";
+    const calls = [];
+    const api = {fetchApi: async (path, options) => {
+        const body = options?.body ? JSON.parse(options.body) : null; calls.push([path, body]);
+        const result = path.endsWith("/native/prepare") ? {id: "new-target", status: "prepared"} :
+            path.includes("/jobs/") ? {id: path.split("/").at(-1), status: "succeeded"} : {};
+        return {ok: true, json: async () => result};
+    }};
+    const app = {registerExtension() {}, graph, nodeOutputs: {}, graphToPrompt: async () => ({output: {}, workflow: {}})};
+    const {generate} = await load(app, {FormData: class {}, crypto: {randomUUID: () => "batch-id"}}, api);
+    await generate([target], true);
+    const prepared = calls.filter(([path]) => path.endsWith("/native/prepare")).map(([, body]) => body);
+    assert.deepEqual(prepared.map(body => body.owner_id), ["target"]);
+    assert.equal(prepared[0].references[0].job_id, "previous-job");
+    assert.equal(calls.some(([path]) => path.endsWith("/jobs/unknown-job")), false);
+    assert.equal(previous.widgets[1].value, "previous-job");
+    assert.equal(later.widgets[1].value, "later-job");
+    assert.equal(later.properties.astrogate_images[0].filename, "later.png");
+});
+
+for (const force of [false, true]) test(`selected predecessors update before selected later frames regardless of selection order (force=${force})`, async () => {
+    const {graph, LiteGraph} = graphMock();
+    const make = name => {
+        const node = LiteGraph.createNode("AstroGateStoryboardFrame"); graph.add(node);
+        node.widgets[0].value = name; node.widgets[1].value = name + "-old";
+        node.properties = {astrogate_project: "p", astrogate_owner: name, astrogate_base_prompt: name};
+        return node;
+    };
+    const previous = make("previous"), target = make("target");
+    target.addInput("reference_images.reference_1", "IMAGE"); previous.connect(0, target, 0);
+    const prepared = [];
+    const api = {fetchApi: async (path, options) => {
+        const body = options?.body ? JSON.parse(options.body) : null;
+        if (path.endsWith("/native/prepare")) prepared.push(body);
+        const result = path.endsWith("/native/prepare") ? {id: body.owner_id + "-new", status: "prepared"} :
+            path.includes("/jobs/") ? {status: "succeeded"} : {};
+        return {ok: true, json: async () => result};
+    }};
+    const app = {registerExtension() {}, graph, nodeOutputs: {}, graphToPrompt: async () => ({output: {}, workflow: {}})};
+    const {generate, nodeSignature} = await load(app, {FormData: class {}, crypto: {randomUUID: () => "batch-id"}}, api);
+    target.properties.astrogate_signature = nodeSignature(target);
+    previous.widgets[0].value = "修改前图";
+    await generate([target, previous], force);
+    assert.deepEqual(prepared.map(body => body.owner_id), ["previous", "target"]);
+    assert.equal(prepared[1].references[0].job_id, "previous-new");
+    assert.equal(prepared.every(body => body.force === force), true);
 });
 
 test('batch skips unknown and running branches but still queues independent targets',async()=>{
@@ -594,6 +659,11 @@ test('image card controls precede a folded prompt and batch progress counts only
     batchProgress(node,new Map([['a',{status:'succeeded'}],['b',{status:'running'}],['c',{status:'queued'}],['d',{status:'unknown'}]]));
     assert.equal(node.agProgress.bar.value,1);assert.equal(node.agProgress.bar.max,4);
     assert.match(node.agProgress.label.textContent,/已完成 1\/4.*未完成\/异常 1/);
+    node.properties.astrogate_kind='prop';node.agRefresh();node.agRefresh();
+    assert.match(node.widgets[0].value,/纯白或浅灰.*不画人物.*不绘制使用场景/);
+    assert.equal(node.widgets[0].value.split('物品设定素材：').length,2);
+    assert.equal(elements.find(e=>e.tag==='textarea').value,node.widgets[0].value);
+    assert.equal(node.properties.astrogate_images[0].filename,'old.png');
     node.onRemoved();assert.equal(disconnected,true);
 });
 

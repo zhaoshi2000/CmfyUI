@@ -5,6 +5,7 @@ const base = "/astrogate/storyboard";
 const states = {prepared: "等待参考图 / 排队中", queued: "排队中", running: "正在生成", analysing: "正在分析剧本", succeeded: "已完成", failed: "失败", blocked: "本批次未执行", unknown: "结果未知 · 可明确重绘", cancelling: "正在停止", cancelled: "已取消"};
 const active = new Set(["prepared", "queued", "running", "analysing", "cancelling"]);
 const sceneOnly = "无人环境素材：只绘制建筑、空间、陈设与光照，不出现任何人物、路人、剪影或人物倒影。";
+const propOnly = "物品设定素材：只画当前物品，完整展示外形与材质，干净的纯白或浅灰单色背景；不画人物、手、房间、桌面或其他物品，不拼贴、不分屏、不绘制使用场景。";
 const sceneAngles = {scene_left: "左侧机位", scene_right: "右侧机位", scene_reverse: "反打机位", scene_high: "高位俯视"};
 const kindLabels = {character: "人物", look: "人物造型", scene: "场景", scene_state: "场景状态", prop: "道具", shot: "分镜"};
 const referenceRoles = {auto: "自动", character: "人物身份", look: "人物造型", scene: "场景", prop: "道具", style: "画风参考", effect: "特效 / 氛围", previous: "前帧"};
@@ -504,16 +505,11 @@ function upgradeSignature(node) {
     const current = JSON.parse(nodeSignature(node));
     if (p.astrogate_signature === JSON.stringify(current.slice(0, 6))) p.astrogate_signature = JSON.stringify(current);
 }
-function changed(node, seen = new Set()) {
-    if (seen.has(node.id)) throw new Error("图片参考存在循环，请断开其中一条 IMAGE 连线。");
-    seen.add(node.id);
+function changed(node) {
     const p = node.properties;
-    const result = value(node, "prompt") !== p.astrogate_base_prompt ||
+    return Boolean(value(node, "prompt") !== p.astrogate_base_prompt ||
         (p.astrogate_base_settings && JSON.stringify(p.astrogate_base_settings) !== JSON.stringify([value(node, "aspect_ratio"), value(node, "resolution"), value(node, "quality")])) ||
-        (p.astrogate_signature && p.astrogate_signature !== nodeSignature(node)) ||
-        imageSources(node).some(r => r.node.type === "AstroGateStoryboardFrame" && changed(r.node, seen));
-    seen.delete(node.id);
-    return Boolean(result);
+        (p.astrogate_signature && p.astrogate_signature !== nodeSignature(node)));
 }
 let submitting = false;
 async function generate(targets, force = false, reporter = targets[0]) {
@@ -521,9 +517,11 @@ async function generate(targets, force = false, reporter = targets[0]) {
     if (!targets.length) throw new Error("请先选中分镜图片卡片。");
     if (submitting) throw new Error("正在准备本次请求，请稍候。");
     submitting = true;
+    const selected = new Set(targets.map(node => node.id));
     const prepared = [], visited = new Set(), visiting = new Set(), checks = new Map();
     let submitted = false;
     async function inspect(node, requested) {
+        requested ||= selected.has(node.id);
         if (checks.has(node.id)) return checks.get(node.id);
         if (visiting.has(node.id)) throw new Error("图片参考存在循环，请断开其中一条 IMAGE 连线。");
         visiting.add(node.id);
@@ -534,7 +532,7 @@ async function generate(targets, force = false, reporter = targets[0]) {
             issue = {source: node, jobId, reason: "已有任务正在进行，请等待结束后再生成。"};
         } else if (previous?.status === "unknown" && !(requested && force && targets.length === 1)) {
             issue = {source: node, jobId, reason: "上次结果未知；请先确认结果，或在此卡片点击“重绘”。"};
-        } else if (!(previous?.status === "succeeded" && !changed(node) && !(requested && force))) {
+        } else if (!(previous?.status === "succeeded" && (!requested || !changed(node)) && !(requested && force))) {
             for (const ref of imageSources(node)) {
                 if (ref.node.type !== "AstroGateStoryboardFrame") continue;
                 issue = await inspect(ref.node, false);
@@ -546,13 +544,14 @@ async function generate(targets, force = false, reporter = targets[0]) {
         return issue;
     }
     async function visit(node, requested) {
+        requested ||= selected.has(node.id);
         if (visited.has(node.id)) return;
         if (visiting.has(node.id)) throw new Error("图片参考存在循环，请断开其中一条 IMAGE 连线。");
         visiting.add(node.id);
         const project = node.properties.astrogate_project;
         if (!project) throw new Error("请从 TXT → AI 分镜脚本建立图片卡片；自由生图使用 AstroGate AI 生成图像节点。");
         const previous = value(node, "job_id") ? await request(`/jobs/${value(node, "job_id")}`) : null;
-        const unchanged = !changed(node);
+        const unchanged = !requested || !changed(node);
         if (previous?.status === "succeeded" && unchanged && !(requested && force)) {
             visited.add(node.id);
             visiting.delete(node.id);
@@ -595,7 +594,15 @@ async function generate(targets, force = false, reporter = targets[0]) {
             if (!targets.includes(reporter)) message(reporter, `本次没有可执行的图片，${targets.length} 张等待确认或上游任务。`, false, true);
             return;
         }
-        for (const node of ready) await visit(node, true);
+        const ordered = [], orderedIds = new Set(), readyIds = new Set(ready.map(node => node.id));
+        function order(node) {
+            if (orderedIds.has(node.id)) return;
+            orderedIds.add(node.id);
+            for (const ref of imageSources(node)) if (readyIds.has(ref.node.id)) order(ref.node);
+            ordered.push(node);
+        }
+        ready.forEach(order);
+        for (const node of ordered) await visit(node, true);
         const count = prepared.filter(j => j.status !== "succeeded").length;
         const batchReporter = targets.includes(reporter) && !ready.includes(reporter) ? ready[0] : reporter;
         message(batchReporter, `本次 ${count} 张新图 · ${Math.max(0, visited.size - count)} 张复用${targets.length > ready.length ? ` · ${targets.length - ready.length} 张等待确认或上游` : ""} · 按 IMAGE 连线执行`, true);
@@ -953,6 +960,7 @@ function installFrame(node) {
         }
         const scene = ["scene", "scene_state"].includes(node.properties.astrogate_kind);
         if (scene && !String(value(node, "prompt")).includes(sceneOnly)) setValue(node, "prompt", `${value(node, "prompt") || ""}\n${sceneOnly}`);
+        if (node.properties.astrogate_kind === "prop" && !String(value(node, "prompt")).includes(propOnly)) setValue(node, "prompt", `${value(node, "prompt") || ""}\n${propOnly}`);
         prompt.value = value(node, "prompt") || "";
         atmosphere.value = node.properties.astrogate_atmosphere || "";
         atmosphereField.hidden = node.properties.astrogate_kind !== "shot";

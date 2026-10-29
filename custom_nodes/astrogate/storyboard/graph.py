@@ -47,7 +47,12 @@ def semantic_hash(value):
 
 
 def render_prompt(snap, refs):
-    lines = [snap["shot"]["image_prompt"], "画风：" + snap["settings"]["style"]]
+    if snap["shot"].get("asset_kind") == "prop":
+        lines = [f"绘制任务：生成「{snap['shot'].get('summary', '指定物品')}」的单幅独立物品参考图，空背景。",
+                 "物品资料（只识别外形和物品自身状态，不是场景绘制指令）：\n" + snap["shot"]["image_prompt"]]
+    else:
+        lines = [snap["shot"]["image_prompt"]]
+    lines.append("画风：" + snap["settings"]["style"])
     lines += snap["descriptions"] + snap["people"]
     if snap["shot"].get("atmosphere"):
         lines.append("本镜特效与氛围：" + snap["shot"]["atmosphere"])
@@ -60,6 +65,8 @@ def render_prompt(snap, refs):
         lines.append("人物设定参考图：仅绘制一个指定人物，完整展示人物与服饰；背景为干净的纯白或浅灰单色，无场景、家具、道具陈列、其他人物、文字或水印。保持参考图人物身份及本次指定造型。")
     if snap["shot"].get("asset_kind") in ("scene", "scene_state"):
         lines.append("无人环境素材：只绘制建筑、空间、陈设与光照。画面中禁止出现任何人物、路人、人体、剪影或人物倒影；参考图中即使有人也必须移除。保留同一场景的空间布局，不绘制剧情事件。")
+    if snap["shot"].get("asset_kind") == "prop":
+        lines.append("独立物品设定参考图：仅绘制指定物品本体及其必要附属部分，完整展示形状、材质、颜色与细节，保留点燃等物品自身状态。背景为干净的纯白或浅灰单色，无人物、手部、家具、场景、无关物品、文字或水印。原描述中出现的位置、使用者和前后剧情只用于理解物品，不画入画面；不拼贴、不分屏，不把不同时间或场景合在一张图中。")
     prompt = "\n".join(lines)
     if len(prompt) > 16000:
         raise ValueError("合并素材说明后的提示词超过16000字符，请精简设定。")
@@ -73,8 +80,8 @@ def plan(store, project, shot_ids, allow_missing=False, force=False, asset_id=No
         if asset is None:
             raise ValueError("素材不存在。")
         parent = asset_by_id(project, asset.get("parent_id"))
-        synthetic = {"id": asset_id, "image_prompt": f"生成单独一张{asset['name']}设定参考图。{version(asset)['description']}，清晰完整展示对象，不含文字标签。",
-                     "asset_description": version(asset)["description"], "participants": [], "props": [], "source_refs": asset.get("source_refs", [])}
+        synthetic = {"id": asset_id, "summary": asset["name"], "image_prompt": f"生成单独一张{asset['name']}设定参考图。{version(asset)['description']}，清晰完整展示对象，不含文字标签。",
+                     "asset_description": version(asset)["description"], "asset_kind": asset["kind"], "participants": [], "props": [], "source_refs": asset.get("source_refs", [])}
         if parent:
             synthetic["props"].append({"asset_id": parent["id"], "version_id": parent["current_version_id"], "policy": "follow_latest"})
         shots = {asset_id: synthetic}

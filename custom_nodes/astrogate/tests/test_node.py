@@ -103,6 +103,46 @@ def test_text_import_connects_to_storyboard(node):
     assert script.get_io_type() == source.outputs[0].io_type
 
 
+async def test_completed_frame_reads_saved_image_after_live_inputs_change(node, monkeypatch, tmp_path):
+    Image.new("RGB", (4, 3), (10, 20, 30)).save(tmp_path / "saved.png")
+    job = {"id": "saved", "native": True, "status": "succeeded", "project_id": "p", "owner_id": "lamp",
+           "snapshot": {"shot": {"summary": "油灯", "image_prompt": "旧提示词"}}, "prompt": "旧请求",
+           "result_image": {"file": "saved.png"}, "saved_result": {"filename": "saved.png", "subfolder": "", "type": "output"}}
+    monkeypatch.setattr(node, "get_store", lambda: SimpleNamespace(job=lambda _: job, image_path=lambda file: tmp_path / file))
+    monkeypatch.setattr(node.AstroGateStoryboardFrame, "hidden", SimpleNamespace(prompt={}), raising=False)
+
+    async def unexpected_request(*args):
+        pytest.fail("Reading a completed reference must not request another image")
+
+    monkeypatch.setattr(node, "generate_image", unexpected_request)
+    result = await node.AstroGateStoryboardFrame.execute("新提示词", "saved", element_id="lamp", aspect_ratio="9:16",
+                                                       resolution="1K", quality="low", board=["changed-board", 0], story_context=["changed-story", 1])
+    assert result.result[0].shape == (1, 3, 4, 3)
+    np.testing.assert_allclose(result.result[0][0, 0, 0], np.array([10, 20, 30]) / 255, atol=1e-6)
+    assert result.result[1]["summary"] == "油灯"
+    with pytest.raises(ValueError, match="任务与图片节点不匹配"):
+        await node.AstroGateStoryboardFrame._execute_frame("新提示词", "saved", element_id="different")
+
+
+async def test_completed_frame_missing_file_becomes_unknown_without_regeneration(node, monkeypatch, tmp_path):
+    job = {"id": "missing", "native": True, "status": "succeeded", "project_id": "p", "owner_id": "lamp",
+           "snapshot": {"shot": {"summary": "油灯"}}, "result_image": {"file": "missing.png"}}
+    updates = []
+    store = SimpleNamespace(job=lambda _: job, image_path=lambda file: tmp_path / file,
+                            update_job=lambda *args, **kwargs: updates.append((args, kwargs)))
+    monkeypatch.setattr(node, "get_store", lambda: store)
+
+    async def unexpected_request(*args):
+        pytest.fail("A missing completed result must not be regenerated automatically")
+
+    monkeypatch.setattr(node, "generate_image", unexpected_request)
+    result = await node.AstroGateStoryboardFrame.execute("新提示词", "missing", element_id="lamp")
+    assert isinstance(result.result[0], node.ExecutionBlocker)
+    assert updates[0][0] == ("missing",)
+    assert updates[0][1]["expected_status"] == ("succeeded",)
+    assert updates[0][1]["status"] == "unknown"
+
+
 def test_continuity_fields_and_local_cache_revision(node):
     schema = node.AstroGateImage.define_schema()
     assert schema.not_idempotent
