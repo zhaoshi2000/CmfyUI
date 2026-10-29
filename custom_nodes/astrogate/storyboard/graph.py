@@ -4,6 +4,10 @@ import secrets
 from .store import asset_by_id, digest, shot_bindings, version
 
 
+CHARACTER_SHEET_PROMPT = "人物设定参考图：一张完整的人物设定图册，只表现同一个指定人物。左侧为大幅头部至胸部特写，清楚展示脸型、五官、发型与表情；右侧依次并排展示该人物的正面、人物自身左侧90度侧面、背面三幅全身视图，头顶到脚底完整不裁切。各视图必须是同一张脸、同一体型和身高比例、同一套本次指定服装、发型和配饰，不变成不同人物或不同造型。背景为干净的纯白或浅灰单色，无场景、家具、道具陈列、其他人物、文字标签或水印；各视图尺寸与间距整齐，左侧特写大于右侧单幅全身像。"
+SCENE_MASTER_PROMPT = "无人环境素材：生成一张16:9连续的场景全景母图，24mm等效广角、平视机位，中远距离全景，在同一画面尽可能完整交代房间或场地的空间。室内清楚展示墙面、地面、顶面、门窗、通道及主要陈设的相对位置；室外对应展示地形、建筑、道路、植被及主要空间边界。结构与透视合理，画面边缘无明显拉伸，保留设定中的材质、布局、主要光源方向、色温和投影关系，以真实光照呈现，明确光照强度，不添加不合理的多方向光源，不加说明标记。画面中禁止出现任何人物、路人、人体、剪影或人物倒影；参考图中即使有人也必须移除。不绘制剧情事件，只用一个连续机位，不拼贴、不分屏、不做多角度拼图，无文字、标签或水印。"
+
+
 def references(project, shot):
     result, missing, descriptions = [], [], []
     seen = set()
@@ -29,6 +33,8 @@ def references(project, shot):
 def snapshot(project, shot):
     refs, missing, descriptions = references(project, shot)
     settings = {key: project["settings"][key] for key in ("aspect_ratio", "resolution", "quality", "style")}
+    if shot.get("asset_view") == "sheet" or shot.get("asset_kind") in ("scene", "scene_state"):
+        settings["aspect_ratio"] = "16:9"
     people = []
     for person in shot.get("participants", []):
         if person.get("visible") is not True:
@@ -60,11 +66,16 @@ def render_prompt(snap, refs):
         lines.append("参考图用途（按实际输入顺序）：")
         lines.extend(f"图{index + 1}：{ref['purpose']}" for index, ref in enumerate(refs))
         lines.append("每张图仅用于指定对象和用途，不混合不同人物的脸和服装。场景参考中的路人不自动入画。上一帧只参考空间关系，人物名单以本镜为准。")
+        if "asset_description" not in snap["shot"]:
+            lines.append("人物设定图册中的头部特写、正面、左侧和背面是同一个角色的不同视图，不是多个人；每个角色仅按本镜出场人数绘制，不复制成三人或多重人影。场景参考的建筑结构、门窗、通道、家具相对位置与主光源保持一致，材质和主色调保持一致，按本镜调整机位和景别，不因换镜头擅自改动布局。")
     lines.append("只绘制指定的设定素材；默认无文字标签和水印。" if "asset_description" in snap["shot"] else "只画本镜列出的可见人物；默认无字幕、文字标签和水印。")
     if snap["shot"].get("asset_kind") in ("character", "look"):
-        lines.append("人物设定参考图：仅绘制一个指定人物，完整展示人物与服饰；背景为干净的纯白或浅灰单色，无场景、家具、道具陈列、其他人物、文字或水印。保持参考图人物身份及本次指定造型。")
+        if snap["shot"].get("asset_view") == "sheet":
+            lines.append(CHARACTER_SHEET_PROMPT)
+        else:
+            lines.append("人物设定参考图：仅绘制一个指定人物，完整展示人物与服饰；背景为干净的纯白或浅灰单色，无场景、家具、道具陈列、其他人物、文字或水印。保持参考图人物身份及本次指定造型。")
     if snap["shot"].get("asset_kind") in ("scene", "scene_state"):
-        lines.append("无人环境素材：只绘制建筑、空间、陈设与光照。画面中禁止出现任何人物、路人、人体、剪影或人物倒影；参考图中即使有人也必须移除。保留同一场景的空间布局，不绘制剧情事件。")
+        lines.append(SCENE_MASTER_PROMPT.replace("16:9", snap["settings"]["aspect_ratio"], 1))
     if snap["shot"].get("asset_kind") == "prop":
         lines.append("独立物品设定参考图：仅绘制指定物品本体及其必要附属部分，完整展示形状、材质、颜色与细节，保留点燃等物品自身状态。背景为干净的纯白或浅灰单色，无人物、手部、家具、场景、无关物品、文字或水印。原描述中出现的位置、使用者和前后剧情只用于理解物品，不画入画面；不拼贴、不分屏，不把不同时间或场景合在一张图中。")
     prompt = "\n".join(lines)
@@ -82,6 +93,8 @@ def plan(store, project, shot_ids, allow_missing=False, force=False, asset_id=No
         parent = asset_by_id(project, asset.get("parent_id"))
         synthetic = {"id": asset_id, "summary": asset["name"], "image_prompt": f"生成单独一张{asset['name']}设定参考图。{version(asset)['description']}，清晰完整展示对象，不含文字标签。",
                      "asset_description": version(asset)["description"], "asset_kind": asset["kind"], "participants": [], "props": [], "source_refs": asset.get("source_refs", [])}
+        if asset["kind"] in ("character", "look"):
+            synthetic["asset_view"] = "sheet"
         if parent:
             synthetic["props"].append({"asset_id": parent["id"], "version_id": parent["current_version_id"], "policy": "follow_latest"})
         shots = {asset_id: synthetic}

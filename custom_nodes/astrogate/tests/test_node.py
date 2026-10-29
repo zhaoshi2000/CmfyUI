@@ -101,6 +101,8 @@ def test_text_import_connects_to_storyboard(node):
     assert [output.io_type for output in source.outputs] == ["ASTROGATE_SCRIPT", "STRING"]
     script = next(field for field in storyboard.inputs if field.id == "script")
     assert script.get_io_type() == source.outputs[0].io_type
+    props = next(field for field in storyboard.inputs if field.id == "include_props")
+    assert props.optional and props.default is False
 
 
 async def test_completed_frame_reads_saved_image_after_live_inputs_change(node, monkeypatch, tmp_path):

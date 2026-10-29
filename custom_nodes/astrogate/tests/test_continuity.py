@@ -78,3 +78,30 @@ def test_chunk_continuity_only_uses_same_analysis_and_chapter(modules, project):
 def test_invalid_previous_chunk_is_rejected_without_prior_analysis(modules, project):
     with pytest.raises(ValueError, match="上一帧依赖"):
         merge(modules, project, [candidate(project, "s1", previous_local_id="previous_chunk")])
+
+
+@pytest.mark.parametrize(("include_props", "job_include_props"), [(None, None), (False, None), (True, None), (True, False), (False, True)])
+async def test_analysis_passes_prop_generation_setting_to_both_stages(modules, project, monkeypatch, include_props, job_include_props):
+    prop = {"id": "油灯", "name": "油灯", "kind": "prop", "parent_id": None, "aliases": [],
+            "current_version_id": "油灯1", "versions": [{"id": "油灯1", "description": "铜制油灯", "image": None}]}
+    def configure(p):
+        p["assets"].append(prop)
+        if include_props is not None:
+            p["settings"]["include_props"] = include_props
+    modules.store.change(project["id"], configure)
+    calls = []
+    async def request(model, system, content, on_progress=None):
+        calls.append((system, copy.deepcopy(content)))
+        return ('{"assets":[]}' if system == modules.analysis.EXTRACT_PROMPT else '{"shots":[]}'), {}
+    monkeypatch.setattr(modules.analysis, "text_request", request)
+    fields = {"kind": "text", "chapter_id": project["chapters"][0]["id"], "model": "gpt-6-luna", "style": "写实", "density": "精细"}
+    if job_include_props is not None:
+        fields["include_props"] = job_include_props
+    job = modules.store.add_job(project["id"], fields)
+    await modules.analysis.analyse(modules.store, job["id"])
+    assert modules.store.job(job["id"])["status"] == "succeeded"
+    assert [system for system, _ in calls] == [modules.analysis.EXTRACT_PROMPT, modules.analysis.SHOT_PROMPT]
+    for _, content in calls:
+        assert content["generate_prop_assets"] is (job_include_props if job_include_props is not None else include_props is True)
+        assert any(asset["id"] == "油灯" and asset["kind"] == "prop" for asset in content["known_assets"])
+    assert modules.domain.asset_by_id(modules.store.get(project["id"]), "油灯")["versions"] == prop["versions"]

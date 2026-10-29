@@ -566,17 +566,19 @@ class AstroGateStoryboard(io.ComfyNode):
                                  io.String.Input("style", display_name="画风设定", default="写实电影，自然摄影质感，所有人物和场景使用同一画风", multiline=True),
                                  io.String.Input("density", display_name="拆镜要求", default="精细拆镜，保留关键动作、对话反应、空间关系和必要空镜，每镜一张独立关键帧", multiline=True),
                                  io.Int.Input("analysis_revision", display_name="重写编号", default=0, min=0),
-                                 io.String.Input("frame_aspect_ratio", display_name="统一画幅（宽:高）", optional=True, default="16:9")],
+                                 io.String.Input("frame_aspect_ratio", display_name="统一画幅（宽:高）", optional=True, default="16:9"),
+                                 io.Boolean.Input("include_props", display_name="独立物品素材（特殊需要时开启）", optional=True, default=False)],
                          outputs=[io.Custom("ASTROGATE_BOARD").Output(display_name="分镜脚本"), io.String.Output(display_name="脚本 JSON")],
                          hidden=[io.Hidden.unique_id])
 
     @classmethod
-    async def execute(cls, script, text_model, chapter, style, density, analysis_revision=0, frame_aspect_ratio=None):
+    async def execute(cls, script, text_model, chapter, style, density, analysis_revision=0, frame_aspect_ratio=None, include_props=False):
+        store = get_store()
+        settings = {"include_props": include_props}
         if frame_aspect_ratio is not None:
-            ratio = normalize_aspect_ratio(frame_aspect_ratio)
-            store = get_store()
-            if store.get(script["project_id"])["settings"]["aspect_ratio"] != ratio:
-                store.change(script["project_id"], lambda p: p["settings"].update(aspect_ratio=ratio))
+            settings["aspect_ratio"] = normalize_aspect_ratio(frame_aspect_ratio)
+        if any(store.get(script["project_id"])["settings"].get(key) != value for key, value in settings.items()):
+            store.change(script["project_id"], lambda p: p["settings"].update(settings))
         if cls.hidden.unique_id:
             PromptServer.instance.send_progress_text("AI 正在分析剧本、编写分镜与提示词…", cls.hidden.unique_id)
         board = await analyse_native(get_store(), script["project_id"], chapter, text_model, style, density, analysis_revision)

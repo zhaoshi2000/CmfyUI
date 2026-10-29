@@ -2,7 +2,7 @@ import copy
 import secrets
 
 from .analysis import analyse
-from .graph import render_prompt, snapshot
+from .graph import CHARACTER_SHEET_PROMPT, SCENE_MASTER_PROMPT, render_prompt, snapshot
 from .store import aspect_ratio, asset_by_id, binding, digest, invalidate, shot_bindings, version
 
 
@@ -11,7 +11,9 @@ async def analyse_native(store, project_id, chapter_number, model, style, densit
     if not 1 <= chapter_number <= len(project["chapters"]):
         raise ValueError(f"本剧本共 {len(project['chapters'])} 章，请修改章节序号。")
     chapter = project["chapters"][chapter_number - 1]
-    key = digest([project["source"]["hash"], chapter["id"], model, style, density, revision])
+    fields = [project["source"]["hash"], chapter["id"], model, style, density, revision]
+    include_props = project["settings"].get("include_props", False)
+    key = digest(fields + ([True] if include_props else []))
     job = next((j for j in store.jobs(project_id) if j.get("analysis_key") == key), None)
     if job and job["status"] != "succeeded":
         reason = job.get("error") or "本次分析尚未完成。"
@@ -21,7 +23,7 @@ async def analyse_native(store, project_id, chapter_number, model, style, densit
             p["settings"].update(text_model=model, style=style, density=density)
         store.change(project_id, settings)
         job = store.add_job(project_id, {"kind": "text", "chapter_id": chapter["id"], "model": model,
-                                        "style": style, "density": density, "analysis_key": key})
+                                        "style": style, "density": density, "analysis_key": key, "include_props": include_props})
         await analyse(store, job["id"])
         job = store.job(job["id"])
     if job["status"] != "succeeded":
@@ -46,6 +48,8 @@ def local_asset_job(store, project, asset, image, view=None):
     if existing:
         return existing
     shot = asset_shot(project, asset)
+    if view:
+        shot["asset_view"] = view
     snap = snapshot(project, shot)
     folder, filename = image["file"].rsplit("/", 1)
     return store.add_job(project["id"], {"kind": "image", "native": True, "status": "succeeded", "owner_type": "asset",
@@ -67,13 +71,18 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
             previous = all_shots[previous].get("previous_shot_id")
     assets = {}
     parents = {}
+    include_props = project["settings"].get("include_props", False)
     def include_asset(asset_id, version_id=None):
         original = asset_by_id(project, asset_id)
+        if original["kind"] == "prop" and not include_props:
+            return None
         selected = version(original, version_id)
         key = asset_id if selected["id"] == original["current_version_id"] else f"{asset_id}@{selected['id']}"
         if key not in assets:
             if original.get("parent_id"):
-                parents[key] = include_asset(original["parent_id"], selected.get("parent_version_id"))
+                parent = include_asset(original["parent_id"], selected.get("parent_version_id"))
+                if parent:
+                    parents[key] = parent
             assets[key] = {**original, "current_version_id": selected["id"]}
         return key
     for shot in shots:
@@ -81,7 +90,7 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
             include_asset(item["asset_id"], item["version_id"] if item["policy"] == "locked" else None)
     jobs = store.jobs(project["id"])
     nodes, links = [], []
-    colors = {"character": "#355168", "look": "#4d4268", "scene": "#385448", "scene_state": "#385448", "prop": "#635035", "shot": "#294d63"}
+    colors = {"character": "#55436d", "look": "#55436d", "scene": "#385448", "scene_state": "#385448", "prop": "#635035", "shot": "#294d63"}
 
     def add(owner, kind, prompt, position, job=None, key=None, view=""):
         key = key or owner["id"]
@@ -89,7 +98,7 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
             prompt = job["snapshot"]["shot"]["image_prompt"]
         props = {"astrogate_project": project["id"], "astrogate_owner": owner["id"], "astrogate_owner_type": "shot" if kind == "shot" else "asset",
                  "astrogate_kind": kind, "astrogate_key": key, "astrogate_base_prompt": prompt, "astrogate_prompt_folded": True,
-                 "astrogate_view": view, "astrogate_layout_version": 2,
+                 "astrogate_view": view, "astrogate_layout_version": 3,
                  "astrogate_images": [job["saved_result"]] if job and job.get("saved_result") else []}
         if kind == "shot":
             props["astrogate_atmosphere"] = owner.get("atmosphere", "")
@@ -102,11 +111,11 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
             props["astrogate_version"] = owner["current_version_id"]
             props["astrogate_locked"] = "@" in key
         if view:
-            props["astrogate_reference_purpose"] += " · " + ("正面身份基准" if view == "front" else "同一人物的左侧轮廓，不是第二个人物")
+            props["astrogate_reference_purpose"] += " · 同一人物的半身与正侧背全身设定图册，各视图不是不同人物"
         nodes.append({"id": key, "type": "AstroGateStoryboardFrame", "title": owner.get("summary", owner.get("name", "图片")),
                       "pos": position, "color": colors[kind], "properties": props,
                       "widgets": {"prompt": prompt, "job_id": job["id"] if job else "", "element_id": owner["id"],
-                                  "aspect_ratio": "2:3" if kind == "character" else project["settings"]["aspect_ratio"], "resolution": "4K", "quality": "high"}})
+                                  "aspect_ratio": project["settings"]["aspect_ratio"] if kind == "shot" else "16:9", "resolution": "4K", "quality": "high"}})
         if parent:
             nodes[-1]["title"] = f"{parent['name']} / {owner['name']}"
         links.append({"from": "$board", "slot": 0, "to": key, "input": "board", "type": "ASTROGATE_BOARD", "label": "所属分镜脚本"})
@@ -118,46 +127,32 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
         if not children:
             return row + 1
         for child in children:
-            row = place_asset(child, depth + (2 if assets[key]["kind"] == "character" else 1), row)
+            row = place_asset(child, depth + 1, row)
         return row
 
     row = 0
     for root in [key for key in assets if key not in parents]:
         row = place_asset(root, 0, row)
-    shot_column = max(1560, max((pos[0] + (1040 if assets[key]["kind"] == "character" else 560) for key, pos in positions.items()), default=1560))
+    shot_column = max(1560, max((pos[0] + 560 for pos in positions.values()), default=1560))
     for key, asset in assets.items():
         parent = parents.get(key)
         selected = version(asset)
-        view = "front" if asset["kind"] == "character" else ""
-        job = local_asset_job(store, project, asset, selected["image"], view) if selected.get("image") else next(
+        view = "sheet" if asset["kind"] in ("character", "look") else ""
+        image = selected.get("view_images", {}).get("sheet") if view == "sheet" else selected.get("image")
+        job = local_asset_job(store, project, asset, image, view) if image else next(
             (j for j in jobs if j.get("owner_id") == asset["id"] and j["status"] == "succeeded" and
              j.get("asset_view", "") == view and
-             (j.get("asset_version_id") == selected["id"] or j.get("snapshot", {}).get("shot", {}).get("asset_description") == selected["description"])), None)
+             j.get("asset_version_id") == selected["id"]), None)
         prompt = selected["description"]
         if view:
-            prompt = f"{asset['name']}的人物设计正视图。{prompt}\n单独一人，正对镜头，全身完整，双臂自然下垂，纯净背景。保持脸型、体型和年龄特征，不要多视图拼贴和文字。"
+            prompt = f"{asset['name']}的人物设定图册。{prompt}\n{CHARACTER_SHEET_PROMPT}"
         elif asset["kind"] in ("scene", "scene_state"):
-            prompt += "\n这是空场景空间参考图，不绘制人物；人物只在后续分镜帧中出现。"
+            prompt += "\n" + SCENE_MASTER_PROMPT
         add(asset, asset["kind"], prompt, positions[key], job, key, view)
         if key != asset["id"]:
             nodes[-1]["title"] += " · 固定版本"
         if parent:
             links.append({"from": parent, "slot": 0, "to": key, "input": "reference_images.reference_1", "type": "IMAGE", "label": "身份/场景基准"})
-            if asset["kind"] == "look" and assets[parent]["kind"] == "character":
-                links.append({"from": parent + "::left", "slot": 0, "to": key, "input": "reference_images.reference_2", "type": "IMAGE", "label": "人物左视基准"})
-        if view:
-            nodes[-1]["title"] += " · 正视"
-            left_key = key + "::left"
-            left_job = next((j for j in jobs if j.get("owner_id") == asset["id"] and j.get("asset_version_id") == selected["id"]
-                             and j.get("asset_view") == "left" and j["status"] == "succeeded"
-                             and job and any(r.get("job_id") == job["id"] for r in j.get("references", []))), None)
-            left_image = selected.get("view_images", {}).get("left")
-            if left_image:
-                left_job = local_asset_job(store, project, asset, left_image, "left")
-            prompt = f"根据参考正视图生成同一个{asset['name']}的左视图。{selected['description']}\n严格人物自身左侧90度侧面，全身完整，左耳可见，纯净背景。保持参考图的脸型、体型、服装、发型和配饰；只画同一个人，不拼贴、不加文字。"
-            add(asset, "character", prompt, [positions[key][0] + 480, positions[key][1]], left_job, left_key, "left")
-            nodes[-1]["title"] += " · 左视"
-            links.append({"from": key, "slot": 0, "to": left_key, "input": "reference_images.reference_1", "type": "IMAGE", "label": "正视图 → 同一人物左视图"})
 
     for index, shot in enumerate(shots):
         scene_id = (shot.get("scene") or {}).get("asset_id", "none")
@@ -170,7 +165,7 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
             for person in shot.get("participants", []) if person.get("visible") is True] + shot.get("props", [])
         for item in selected_refs:
             key = include_asset(item["asset_id"], item["version_id"] if item["policy"] == "locked" else None)
-            if key not in seen:
+            if key and key not in seen:
                 refs.append(key)
                 seen.add(key)
         if shot.get("previous_shot_id"):
@@ -184,7 +179,7 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
             links.append({"from": shots[index - 1]["id"], "slot": 1, "to": shot["id"], "input": "story_context", "type": "ASTROGATE_STORY", "label": "叙事顺序"})
         nodes[-1]["title"] = f"{index + 1:03d} · {shot['summary']}"
         nodes[-1]["properties"]["astrogate_scene"] = asset_by_id(project, scene_id)["name"] if scene_id != "none" else "空镜 / 未指定场景"
-    return {"project_id": project["id"], "chapter_id": chapter_id, "reference_wiring_version": 2, "nodes": nodes, "links": links}
+    return {"project_id": project["id"], "chapter_id": chapter_id, "layout_version": 3, "reference_wiring_version": 3, "nodes": nodes, "links": links}
 
 
 def prepare_native(store, project, body):
@@ -204,11 +199,15 @@ def prepare_native(store, project, body):
     else:
         raise ValueError("节点归属类型无效。")
     view = body.get("view", "front" if kind == "asset" and asset["kind"] == "character" else "")
-    views = ("front", "left") if kind == "asset" and asset["kind"] == "character" else ("",)
+    views = ("sheet", "front", "left") if kind == "asset" and asset["kind"] == "character" else ("",)
+    if kind == "asset" and asset["kind"] == "look":
+        views = ("", "sheet")
     if kind == "asset" and asset["kind"] in ("scene", "scene_state"):
         views = ("", "scene_left", "scene_right", "scene_reverse", "scene_high")
     if view not in views:
         raise ValueError("素材视图无效。")
+    if view:
+        shot["asset_view"] = view
     shot["image_prompt"] = body["prompt"]
     if kind == "shot":
         atmosphere = body.get("atmosphere", shot.get("atmosphere", ""))
@@ -218,6 +217,8 @@ def prepare_native(store, project, body):
     if kind == "asset" and not view:
         shot["asset_description"] = body["prompt"]
     settings = {**project["settings"], **body["settings"]}
+    if kind == "asset" and (view == "sheet" or asset["kind"] in ("scene", "scene_state")) and "aspect_ratio" not in body["settings"]:
+        settings["aspect_ratio"] = "16:9"
     settings["aspect_ratio"] = aspect_ratio(settings["aspect_ratio"])
     if settings["resolution"] not in ("original", "1K", "2K", "3K", "4K") or settings["quality"] not in ("low", "medium", "high"):
         raise ValueError("图片参数无效。")

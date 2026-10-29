@@ -4,6 +4,10 @@
 .ag-native button:disabled{opacity:.55;cursor:wait}
 .ag-native{font:13px/1.45 system-ui,sans-serif;color:#e1e8ed;background:#171d24;border-radius:8px;padding:10px;box-sizing:border-box;width:100%;height:100%;overflow:auto}
 .ag-native [hidden]{display:none!important}
+.ag-image-card.ag-kind-character,.ag-image-card.ag-kind-look{border:1px solid #76609b;background:#25212d}
+.ag-image-card.ag-kind-scene,.ag-image-card.ag-kind-scene_state{border:1px solid #52856a;background:#1e2a24}
+.ag-image-card.ag-kind-shot{border:1px solid #4488ae;background:#1e2831}
+.ag-image-card.ag-kind-prop{border:1px solid #937745;background:#2b261d}
 .ag-native-actions{display:flex;flex-wrap:wrap;gap:6px;margin:9px 0}
 .ag-native-status{white-space:pre-wrap;color:#a9becf;font-size:12px;margin-top:7px;overflow-wrap:anywhere}
 .ag-native-status.error{color:#ffb4a9}

@@ -67,7 +67,7 @@ def parse_novel(data, title):
             "source": {"id": source_id, "text": text, "encoding": encoding, "hash": hashlib.sha256(data).hexdigest()},
             "chapters": chapters, "assets": [], "shots": [], "workflows": {},
             "settings": {"text_model": "gpt-5.6-terra", "style": "写实电影分镜，自然摄影质感；所有人物和场景使用同一画风", "density": "精细拆镜，保留关键动作、对话反应、空间关系和必要空镜，每镜一张独立关键帧",
-                         "aspect_ratio": "16:9", "resolution": "4K", "quality": "high"}}
+                         "aspect_ratio": "16:9", "resolution": "4K", "quality": "high", "include_props": False}}
 
 
 def chunks(paragraphs, limit=6000):

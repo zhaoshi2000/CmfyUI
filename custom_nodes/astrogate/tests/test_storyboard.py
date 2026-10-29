@@ -520,7 +520,7 @@ def test_native_canvas_wires_draft_assets_and_separates_story(modules, project):
     second.update(id='shot2', story_parent_id='shot1', story_relation='对话回应')
     project['shots'].append(second)
     recipe = native.native_canvas(modules.store, project, project['chapters'][0]['id'])
-    assert len(recipe['nodes']) == 9
+    assert len(recipe['nodes']) == 7
     refs = [l for l in recipe['links'] if l['to'] == 'shot2' and l['type'] == 'IMAGE']
     assert len(refs) == 3
     assert {l['from'] for l in refs} == {'蓝衣', '黑衣', '客栈'}
@@ -532,6 +532,7 @@ def test_native_canvas_wires_draft_assets_and_separates_story(modules, project):
 
 def test_native_canvas_places_nested_props_beyond_look_and_scene(modules, project):
     native = sys.modules[modules.node.__name__ + '.storyboard.native']
+    project['settings']['include_props'] = True
     for name, parent in [('皮包', '黑衣'), ('皮包挂饰', '皮包'), ('木桌', '客栈'), ('油灯', '木桌')]:
         project['assets'].append({'id': name, 'name': name, 'kind': 'prop', 'parent_id': parent,
             'current_version_id': name + '1', 'versions': [{'id': name + '1', 'description': name, 'image': None}]})
@@ -545,7 +546,23 @@ def test_native_canvas_places_nested_props_beyond_look_and_scene(modules, projec
     assert positions['shot1'][0] >= max(pos[0] for key, pos in positions.items() if key != 'shot1') + 460
 
 
-def test_character_pairs_have_stable_ids_layout_and_visible_cast_only(modules, project):
+def test_props_are_text_context_by_default_and_only_create_nodes_when_enabled(modules, project):
+    native = sys.modules[modules.node.__name__ + '.storyboard.native']
+    prop = {'id': '油灯', 'name': '油灯', 'kind': 'prop', 'parent_id': None, 'aliases': [],
+            'current_version_id': '油灯1', 'versions': [{'id': '油灯1', 'description': '点燃的铜制油灯', 'image': None}]}
+    project['assets'].append(prop)
+    project['shots'][0]['props'] = [modules.domain.binding(project, '油灯')]
+    recipe = native.native_canvas(modules.store, project, project['chapters'][0]['id'])
+    assert all(node['properties']['astrogate_kind'] != 'prop' for node in recipe['nodes'])
+    assert all(link['from'] != '油灯' for link in recipe['links'])
+    assert '点燃的铜制油灯' in modules.graph.render_prompt(modules.graph.snapshot(project, project['shots'][0]), [])
+    project['settings']['include_props'] = True
+    recipe = native.native_canvas(modules.store, project, project['chapters'][0]['id'])
+    assert any(node['id'] == '油灯' for node in recipe['nodes'])
+    assert any(link['from'] == '油灯' and link['to'] == 'shot1' for link in recipe['links'])
+
+
+def test_character_sheets_have_stable_ids_layout_and_visible_cast_only(modules, project):
     native = sys.modules[modules.node.__name__ + '.storyboard.native']
     project['settings']['aspect_ratio'] = '2.39:1'
     hidden = copy.deepcopy(project['assets'][0])
@@ -555,24 +572,26 @@ def test_character_pairs_have_stable_ids_layout_and_visible_cast_only(modules, p
     by_id = {n['id']:n for n in recipe['nodes']}
     assert 'mentioned' not in by_id
     for name in ('林夏','周野'):
-        front, left = by_id[name], by_id[name+'::left']
-        assert front['pos'][1] == left['pos'][1] and left['pos'][0] > front['pos'][0]
-        assert front['widgets']['aspect_ratio'] == left['widgets']['aspect_ratio'] == '2:3'
-        assert front['properties']['astrogate_prompt_folded']
-        assert '正视' in front['widgets']['prompt'] and '左视' in left['widgets']['prompt']
-        assert any(l['from']==name and l['to']==name+'::left' and l['type']=='IMAGE' for l in recipe['links'])
-    assert all(n['widgets']['aspect_ratio']=='2.39:1' for n in recipe['nodes'] if n['properties']['astrogate_kind']!='character')
+        sheet = by_id[name]
+        assert name+'::left' not in by_id
+        assert sheet['widgets']['aspect_ratio'] == '16:9'
+        assert sheet['properties']['astrogate_prompt_folded']
+        assert sheet['properties']['astrogate_view'] == 'sheet'
+        assert '头部至胸部特写' in sheet['widgets']['prompt'] and '背面三幅全身视图' in sheet['widgets']['prompt']
+    assert all(n['widgets']['aspect_ratio']==('2.39:1' if n['properties']['astrogate_kind']=='shot' else '16:9') for n in recipe['nodes'])
+    assert len({by_id[key]['color'] for key in ('林夏', '客栈', 'shot1')}) == 3
+    assert recipe['layout_version'] == recipe['reference_wiring_version'] == 3
     assert len({tuple(n['pos']) for n in recipe['nodes']}) == len(recipe['nodes'])
 
 
-def test_shot_uses_each_visible_characters_look_or_front_and_look_uses_both_views(modules, project):
+def test_shot_uses_each_visible_characters_look_or_sheet_and_look_uses_one_sheet(modules, project):
     native = sys.modules[modules.node.__name__ + '.storyboard.native']
     project['shots'][0]['participants'][1]['look'] = None
     recipe = native.native_canvas(modules.store, project, project['chapters'][0]['id'])
     shot_refs = [link['from'] for link in recipe['links'] if link['to']=='shot1' and link['type']=='IMAGE']
     assert shot_refs == ['客栈', '蓝衣', '周野']
     look_refs = [link['from'] for link in recipe['links'] if link['to']=='蓝衣' and link['type']=='IMAGE']
-    assert look_refs == ['林夏', '林夏::left']
+    assert look_refs == ['林夏']
     assert '周野::left' not in shot_refs and '林夏' not in shot_refs
 
 
@@ -743,7 +762,7 @@ async def test_image_recovery_requires_unknown_job_and_project_owner(modules, pr
     assert response.status==400 and '不支持' in (await response.json())['error']
 
 
-async def test_approving_character_views_preserves_locked_versions_and_reuses_the_pair(modules, project, monkeypatch, aiohttp_client):
+async def test_approving_legacy_views_preserves_history_without_reusing_them_as_sheets(modules, project, monkeypatch, aiohttp_client):
     native = sys.modules[modules.node.__name__ + '.storyboard.native']
     service = sys.modules[modules.node.__name__ + '.storyboard.service']
     body = {'owner_id':'林夏','owner_type':'asset','prompt':'正视','settings':{'aspect_ratio':'2:3'},'view':'front'}
@@ -779,11 +798,43 @@ async def test_approving_character_views_preserves_locked_versions_and_reuses_th
     assert saved['shots'][1]['participants'][0]['identity']['version_id']=='林夏1'
     assert not saved['shots'][1]['stale']
     recipe=native.native_canvas(modules.store,saved,saved['chapters'][0]['id'])
-    for view,key in [('front','林夏'),('left','林夏::left')]:
-        node=next(n for n in recipe['nodes'] if n['id']==key)
-        job=modules.store.job(node['widgets']['job_id'])
-        assert job['asset_version_id']==selected['id'] and job['asset_view']==view
-        assert job['result_image']==selected['view_images'][view]
+    node=next(n for n in recipe['nodes'] if n['id']=='林夏')
+    assert node['properties']['astrogate_view']=='sheet'
+    assert node['widgets']['job_id']==''
+    assert all(n['id']!='林夏::left' for n in recipe['nodes'])
+
+
+@pytest.mark.parametrize('owner', ['林夏', '蓝衣'])
+async def test_approved_sheet_is_reused_as_one_card_and_keeps_version_ownership(modules, project, monkeypatch, aiohttp_client, owner):
+    native = sys.modules[modules.node.__name__ + '.storyboard.native']
+    service = sys.modules[modules.node.__name__ + '.storyboard.service']
+    job = native.prepare_native(modules.store, project, {'owner_id': owner, 'owner_type': 'asset', 'view': 'sheet',
+        'prompt': '人物设定卡', 'settings': {}})
+    assert job['settings']['aspect_ratio'] == '16:9'
+    image = {'file': 'astrogate/sheet.png', 'hash': 'sheet'}
+    modules.store.update_job(job['id'], status='succeeded', result_image=image)
+    routes = web.RouteTableDef()
+    monkeypatch.setattr(service, 'get_store', lambda: modules.store)
+    monkeypatch.setattr(service, 'PromptServer', SimpleNamespace(instance=SimpleNamespace(routes=routes,
+        user_manager=SimpleNamespace(get_request_user_id=lambda request: 'default'))))
+    service.register_routes()
+    app = web.Application()
+    app.add_routes(routes)
+    client = await aiohttp_client(app)
+    response = await client.post('/astrogate/storyboard/projects/'+project['id']+'/edit', json={'action': 'approve', 'job_id': job['id']})
+    assert response.status == 200, await response.text()
+    saved = modules.store.get(project['id'])
+    asset = modules.domain.asset_by_id(saved, owner)
+    selected = modules.domain.version(asset)
+    assert selected['image'] == image and selected['view_images'] == {'sheet': image}
+    assert asset['versions'][0]['image'] is None
+    if owner == '蓝衣':
+        assert asset['parent_id'] == '林夏' and selected['parent_version_id'] == '林夏1'
+    recipe = native.native_canvas(modules.store, saved, saved['chapters'][0]['id'])
+    card = next(node for node in recipe['nodes'] if node['id'] == owner)
+    reused = modules.store.job(card['widgets']['job_id'])
+    assert reused['asset_view'] == 'sheet' and reused['asset_version_id'] == selected['id']
+    assert reused['result_image'] == image
 
 
 @pytest.mark.parametrize('ratio', ['2.39:1','9：16',' 16:9 '])
@@ -820,7 +871,7 @@ def test_character_reference_sheet_keeps_people_and_view_order_separate(modules)
     assert '同一人物' in purposes[0]['purpose']
 
 
-async def test_native_pair_workflow_uses_both_views_for_look_and_sends_looks_to_shot(modules, project, monkeypatch, tmp_path):
+async def test_native_sheet_workflow_sends_one_identity_sheet_to_look_and_looks_to_shot(modules, project, monkeypatch, tmp_path):
     m = modules.node
     native = sys.modules[m.__name__ + '.storyboard.native']
     recipe = native.native_canvas(modules.store, project, project['chapters'][0]['id'])
@@ -837,16 +888,15 @@ async def test_native_pair_workflow_uses_both_views_for_look_and_sends_looks_to_
     by_request = {j['gateway_request_id']:key for key,j in jobs.items()}
     async def generate(payload, edit):
         key = by_request[payload['gateway_request_id']]
-        if key.endswith('::left'):
-            assert key.removesuffix('::left') in completed
-            assert edit and len(payload['images'])==1
         if key in ('蓝衣','黑衣'):
+            assert ('林夏' if key=='蓝衣' else '周野') in completed
             assert edit and len(payload['images'])==1
-            assert '同一人物双视图图册' in payload['prompt']
+            assert '一张完整的人物设定图册' in payload['prompt']
+            assert '头部至胸部特写' in payload['prompt'] and '背面三幅全身视图' in payload['prompt']
         if key=='shot1':
             assert {'蓝衣','黑衣'} <= completed
             assert len(payload['images'])==3
-            assert '同一人物双视图图册' not in payload['prompt']
+            assert '同一个角色的不同视图，不是多个人' in payload['prompt']
         await asyncio.sleep(.01)
         data=BytesIO()
         Image.new('RGB',(16,24),'blue').save(data,format='PNG')
@@ -1188,8 +1238,9 @@ def test_native_locked_look_keeps_its_own_image_node(modules, project):
     recipe = native.native_canvas(modules.store, project, project['chapters'][0]['id'])
     old = next(n for n in recipe['nodes'] if n['id'] == '蓝衣@蓝衣1')
     assert old['properties']['astrogate_locked']
-    assert old['widgets']['prompt'] == '蓝衣'
-    assert next(n for n in recipe['nodes'] if n['id'] == '蓝衣')['widgets']['prompt'] == '蓝衣加银色饰品'
+    assert '蓝衣加银色饰品' not in old['widgets']['prompt']
+    assert '蓝衣加银色饰品' in next(n for n in recipe['nodes'] if n['id'] == '蓝衣')['widgets']['prompt']
+    assert old['properties']['astrogate_view'] == 'sheet'
     old_links = [l for l in recipe['links'] if l['to']=='locked-shot' and l['type']=='IMAGE']
     assert any(l['from']=='蓝衣@蓝衣1' for l in old_links)
     assert not any(l['from']=='蓝衣' for l in old_links)

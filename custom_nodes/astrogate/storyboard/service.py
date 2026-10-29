@@ -130,6 +130,8 @@ def register_routes(recover_image=None):
                     p["settings"]["aspect_ratio"] = ratio
                     p["settings"]["style"] = style
                     invalidate(p, [s["id"] for s in p["shots"]])
+                if "include_props" in body:
+                    p["settings"]["include_props"] = bool(body["include_props"])
             elif action == "settings":
                 values = body["settings"]
                 if values["text_model"] not in MODELS:
@@ -139,7 +141,9 @@ def register_routes(recover_image=None):
                     raise ValueError("图片设置无效。")
                 if any(values[k] != p["settings"][k] for k in ("style", "aspect_ratio", "resolution", "quality")):
                     invalidate(p, [s["id"] for s in p["shots"]])
-                p["settings"] = {k: values[k] for k in p["settings"]}
+                p["settings"] = {k: values.get(k, p["settings"][k]) for k in p["settings"]}
+                if "include_props" in values:
+                    p["settings"]["include_props"] = bool(values["include_props"])
             elif action == "shot":
                 shot = next(s for s in p["shots"] if s["id"] == body["shot"]["id"])
                 replacement = {**body["shot"], "id": shot["id"], "chapter_id": shot["chapter_id"], "revision": shot["revision"] + 1}
@@ -171,7 +175,7 @@ def register_routes(recover_image=None):
                 asset = asset_by_id(p, job["owner_id"])
                 if job.get("asset_view", "").startswith("scene_"):
                     raise ValueError("补充机位已独立保存，请从场景基准节点设为定稿素材。")
-                if job.get("asset_view"):
+                if job.get("asset_view") in ("front", "left"):
                     selected = version(asset, job["asset_version_id"])
                     views = {}
                     if job["asset_view"] == "front":
@@ -186,8 +190,10 @@ def register_routes(recover_image=None):
                     record["view_images"] = views
                     return
                 parent = job["snapshot"]["shot"].get("props", [])
-                publish_version(p, asset["id"], job["snapshot"]["shot"]["asset_description"], job["result_image"],
-                                parent[0]["version_id"] if parent else None)
+                record = publish_version(p, asset["id"], job["snapshot"]["shot"]["asset_description"], job["result_image"],
+                                         parent[0]["version_id"] if parent else None)
+                if job.get("asset_view") == "sheet":
+                    record["view_images"] = {"sheet": job["result_image"]}
             elif action == "workflow":
                 chapter_id = body["chapter_id"]
                 if chapter_id not in {c["id"] for c in p["chapters"]}:
@@ -229,7 +235,7 @@ def register_routes(recover_image=None):
             raise ValueError("本章已有分析记录。可继续编辑现有镜头，或明确选择重新分析（保留旧镜头）。")
         settings = project["settings"]
         job = store.add_job(project["id"], {"kind": "text", "chapter_id": chapter_id, "model": settings["text_model"],
-                                             "style": settings["style"], "density": settings["density"]})
+                                             "style": settings["style"], "density": settings["density"], "include_props": settings.get("include_props", False)})
         task = asyncio.create_task(analyse(store, job["id"]))
         tasks[job["id"]] = task
         task.add_done_callback(lambda _: tasks.pop(job["id"], None))

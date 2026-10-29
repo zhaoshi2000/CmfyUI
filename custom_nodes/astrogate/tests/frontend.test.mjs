@@ -17,10 +17,13 @@ async function load(app, extras = {}, api = {}) {
 }
 function graphMock() {
     let id = 0, linkId = 0;
-    const graph = {_nodes: [], links: {}, add(node) { node.id = ++id; this._nodes.push(node); }, setDirtyCanvas() {}, getNodeById(id) { return this._nodes.find(n => n.id == id); }};
+    const graph = {_nodes: [], links: {}, add(node) { node.id = ++id; this._nodes.push(node); },
+        remove(node) { this._nodes = this._nodes.filter(n => n !== node); for (const [key, link] of Object.entries(this.links)) if (link.origin_id === node.id || link.target_id === node.id) delete this.links[key]; },
+        setDirtyCanvas() {}, getNodeById(id) { return this._nodes.find(n => n.id == id); }};
     const LiteGraph = {createNode(type) {
         return {type, properties: {}, widgets: ["prompt", "job_id", "element_id", "aspect_ratio", "resolution", "quality"].map(name => ({name, value: ""})), inputs: [],
             findInputSlot(name) { return this.inputs.findIndex(i => i.name === name); },
+            serialize() { return {id: this.id, type: this.type, properties: structuredClone(this.properties), widgets_values: this.widgets.map(w => w.value)}; },
             addInput(name, type) { this.inputs.push({name, type}); }, setDirtyCanvas() {},
             connect(output, target, slot) { const id = ++linkId; graph.links[id] = {origin_id: this.id, origin_slot: output, target_id: target.id}; target.inputs[slot].link = id; },
             disconnectInput(slot) { const input = this.inputs[slot]; if (input?.link != null) { delete graph.links[input.link]; input.link = null; } },
@@ -523,12 +526,11 @@ test('compact log panel keeps logs when collapsed and cancels only the selected 
 
 test('building a chapter queues images once and the saved auto marker survives restore',async()=>{
     const {graph,LiteGraph,board}=analysisGraph();
-    const recipe={project_id:'project',chapter_id:'chapter-id',nodes:['front','left','shot'].map((id,i)=>({id,type:'AstroGateStoryboardFrame',title:id,pos:[i*500,100],
-        widgets:{prompt:id,job_id:'',aspect_ratio:i<2?'2:3':'16:9',resolution:'1K',quality:'high'},
+    const recipe={project_id:'project',chapter_id:'chapter-id',layout_version:3,reference_wiring_version:3,nodes:['sheet','shot'].map((id,i)=>({id,type:'AstroGateStoryboardFrame',title:id,pos:[i*500,100],
+        widgets:{prompt:id,job_id:'',aspect_ratio:'16:9',resolution:'1K',quality:'high'},
         properties:{astrogate_project:'project',astrogate_owner:id==='shot'?'shot':'actor',astrogate_owner_type:id==='shot'?'shot':'asset',astrogate_key:id,astrogate_kind:id==='shot'?'shot':'character',astrogate_view:id==='shot'?'':id,astrogate_base_prompt:id}})),
-        links:[...['front','left','shot'].map(to=>({from:'$board',slot:0,to,input:'board',type:'ASTROGATE_BOARD'})),
-            {from:'front',slot:0,to:'left',input:'reference_images.reference_1',type:'IMAGE'},
-            {from:'front',slot:0,to:'shot',input:'reference_images.reference_1',type:'IMAGE'}]};
+        links:[...['sheet','shot'].map(to=>({from:'$board',slot:0,to,input:'board',type:'ASTROGATE_BOARD'})),
+            {from:'sheet',slot:0,to:'shot',input:'reference_images.reference_1',type:'IMAGE'}]};
     const calls=[];
     const api={fetchApi:async(path,options)=>{
         const body=options?.body?JSON.parse(options.body):null;
@@ -543,11 +545,10 @@ test('building a chapter queues images once and the saved auto marker survives r
     assert.equal(calls.filter(([p])=>p.endsWith('/native/canvas')).length,1);
     assert.equal(calls.filter(([p])=>p==='/prompt').length,1);
     const prepared=calls.filter(([p])=>p.endsWith('/native/prepare')).map(([,b])=>b);
-    assert.deepEqual(prepared.map(b=>b.prompt),['front','shot','left']);
-    const left=prepared.find(b=>b.prompt==='left');
-    assert.equal(left.references[0].job_id,'job-front');
-    assert.equal(left.view,'left');
-    assert.equal(board.properties.astrogate_generation_jobs.length,3);
+    assert.deepEqual(prepared.map(b=>b.prompt),['sheet','shot']);
+    assert.equal(prepared.find(b=>b.prompt==='shot').references[0].job_id,'job-sheet');
+    assert.equal(prepared.find(b=>b.prompt==='sheet').view,'sheet');
+    assert.equal(board.properties.astrogate_generation_jobs.length,2);
     await buildBoard(board,info,true);
     assert.equal(calls.filter(([p])=>p==='/prompt').length,1);
     board.properties.astrogate_autogenerate=false;
@@ -572,6 +573,53 @@ test('migrating an existing chapter simplifies wiring without starting a new ima
     assert.equal(calls.includes('/prompt'),false);
 });
 
+test('sheet migration removes old side cards and default props while preserving results and manual references',async()=>{
+    const {graph,LiteGraph,board}=analysisGraph();
+    const {mountGraph,changed,nodeSignature}=await load({registerExtension(){},graph,nodeOutputs:{}},{LiteGraph});
+    const items=[['actor','character','front'],['actor::left','character','left'],['look','look',''],['scene','scene',''],['lamp','prop',''],['shot','shot','']]
+        .map(([id,kind,view],i)=>({id,type:'AstroGateStoryboardFrame',title:id,pos:[i*500,0],
+            widgets:{prompt:'old '+id,job_id:'job-'+id,aspect_ratio:'2:3',resolution:'4K',quality:'high'},
+            properties:{astrogate_project:'project',astrogate_key:id,astrogate_owner:id==='actor::left'?'actor':id,
+                astrogate_kind:kind,astrogate_view:view,astrogate_layout_version:2,astrogate_base_prompt:'old '+id,
+                astrogate_images:[{filename:id+'.png'}]}}));
+    const wire=(from,to,n)=>({from,to,slot:0,input:'reference_images.reference_'+n,type:'IMAGE'});
+    const old={project_id:'project',chapter_id:'chapter-id',reference_wiring_version:2,nodes:items,
+        links:[wire('actor','look',1),wire('actor::left','look',2),wire('scene','shot',1),wire('actor','shot',2),wire('actor::left','shot',3),wire('look','shot',4),wire('lamp','shot',5)]};
+    const mapping=mountGraph(board,old);
+    const actor=mapping.get('actor'),look=mapping.get('look'),shot=mapping.get('shot');
+    const manual=LiteGraph.createNode('LoadImage');graph.add(manual);
+    shot.addInput('reference_images.reference_6','IMAGE');manual.connect(0,shot,5);
+    shot.properties.astrogate_reference_roles={'reference_images.reference_6':{source:String(manual.id),role:'style',detail:'手动画风'}};
+    shot.properties.astrogate_signature=nodeSignature(shot);
+    const next={...old,layout_version:3,reference_wiring_version:3,
+        nodes:items.filter(item=>!['actor::left','lamp'].includes(item.id)).map(item=>({...item,
+            widgets:{...item.widgets,prompt:['character','look'].includes(item.properties.astrogate_kind)?'new sheet '+item.id:item.widgets.prompt,aspect_ratio:'16:9'},
+            properties:{...item.properties,astrogate_layout_version:3,astrogate_view:['character','look'].includes(item.properties.astrogate_kind)?'sheet':''}})),
+        links:[wire('actor','look',1),wire('scene','shot',1),wire('look','shot',2)]};
+    mountGraph(board,next,true);
+    assert.equal(graph._nodes.some(node=>['actor::left','lamp'].includes(node.properties.astrogate_key)),false);
+    assert.equal(board.properties.astrogate_previous_asset_layout.nodes.length,2);
+    assert.equal(actor.properties.astrogate_previous_view.prompt,'old actor');
+    assert.equal(actor.properties.astrogate_view,'sheet');
+    assert.equal(actor.widgets[1].value,'job-actor');
+    assert.equal(actor.properties.astrogate_images[0].filename,'actor.png');
+    const sources=node=>node.inputs.filter(input=>input.link!=null).map(input=>graph.getNodeById(graph.links[input.link].origin_id));
+    assert.deepEqual(sources(look),[actor]);
+    assert.deepEqual(sources(shot),[mapping.get('scene'),look,manual]);
+    assert.equal(shot.properties.astrogate_images[0].filename,'shot.png');
+    assert.equal(changed(shot),false);
+    assert.equal(changed(actor),true);
+    assert.equal(shot.properties.astrogate_reference_roles['reference_images.reference_6'].detail,'手动画风');
+    const enabled={...next,nodes:[...next.nodes,items.find(item=>item.id==='lamp')],links:[...next.links,wire('lamp','shot',2)]};
+    const restored=mountGraph(board,enabled,true).get('lamp');
+    assert.ok(sources(shot).includes(restored));
+    assert.ok(sources(shot).includes(manual));
+    assert.equal(board.properties.astrogate_previous_asset_layout.nodes.length,2);
+    mountGraph(board,next,true);
+    assert.equal(board.properties.astrogate_previous_asset_layout.nodes.length,3);
+    assert.ok(sources(shot).includes(manual));
+});
+
 test('existing chapter wiring waits for running image jobs before migration',async()=>{
     const {graph,LiteGraph,board}=analysisGraph();
     board.properties.astrogate_board={project_id:'project',chapter_id:'chapter-id',analysis_id:'analysis'};
@@ -589,19 +637,19 @@ test('existing chapter wiring waits for running image jobs before migration',asy
     assert.equal(calls.filter(([path])=>path.endsWith('/native/canvas')).length,1);
 });
 
-test('global aspect changes scene frames while keeping character designs and old images',async()=>{
+test('global frame aspect leaves character sheets and scene masters independent and preserves old images',async()=>{
     const {graph,LiteGraph,board}=analysisGraph();
     board.widgets.push({name:'frame_aspect_ratio',value:'2.390：1'});
     const frames=['character','scene','shot'].map(kind=>{
         const n=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(n);
         n.properties={astrogate_kind:kind,astrogate_images:[{filename:'old.png'}]};
-        n.widgets.find(w=>w.name==='aspect_ratio').value='2:3';
+        n.widgets.find(w=>w.name==='aspect_ratio').value='16:9';
         n.addInput('board','ASTROGATE_BOARD');board.connect(0,n,0);return n;
     });
     const calls=[];
     const {applyFrameAspect}=await load({registerExtension(){},graph},{FormData:class{}},analysisAPI(calls,[]));
     await applyFrameAspect(board);
-    assert.deepEqual(frames.map(n=>n.widgets.find(w=>w.name==='aspect_ratio').value),['2:3','2.39:1','2.39:1']);
+    assert.deepEqual(frames.map(n=>n.widgets.find(w=>w.name==='aspect_ratio').value),['16:9','16:9','2.39:1']);
     assert.ok(frames.every(n=>n.properties.astrogate_images[0].filename==='old.png'));
     assert.equal(JSON.parse(calls[0][1]).action,'frame_aspect_ratio');
     assert.equal(JSON.parse(calls[0][1]).style,'电影光线，雨夜\n第二行');
@@ -628,7 +676,7 @@ test('image card controls precede a folded prompt and batch progress counts only
     class ResizeObserver { constructor(callback){resize=callback;} observe(){} disconnect(){disconnected=true;} }
     const {installFrame,batchProgress}=await load({registerExtension(){},graph,nodeOutputs:{}},{ResizeObserver,document:{createElement:tag=>new Element(tag)}},{apiURL:path=>path});
     installFrame(node);
-    const root=elements.find(e=>e.className==='ag-native ag-image-card').children[0];
+    const root=elements.find(e=>e.className?.startsWith('ag-native ag-image-card')).children[0];
     const detail=elements.find(e=>e.tag==='details');
     assert.equal(root.children[3].className,'ag-native-actions');
     assert.equal(root.children[5],detail);
@@ -706,7 +754,7 @@ test('legacy cards preserve cached images while style, atmosphere and reference 
     const originalStyle=style.value;
     style.value='水墨风格';assert.equal(changed(node),true);
     style.value=originalStyle;assert.equal(changed(node),false);
-    const root=elements.find(e=>e.className==='ag-native ag-image-card').children[0];
+    const root=elements.find(e=>e.className?.startsWith('ag-native ag-image-card')).children[0];
     assert.match(root.children[0].textContent,/分镜.*参考图 1/);
     root.children[0].events.click();
     const row=root.children[1].children[0];
