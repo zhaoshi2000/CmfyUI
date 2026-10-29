@@ -49,7 +49,7 @@
 
 新分析保留剧情文字承接，默认不串前帧 IMAGE，可并发生成没有图片依赖的镜头。长篇分块仍传入本章上一块的文字前情。每镜单独选择景别、机位与裁切；关键微动作安排近景或特写，不强制所有人物同时入画。需要锁定某张图时再手动连接参考口。
 
-本机可用 `powershell -File .\custom_nodes\astrogate\start.ps1 -Port 8190` 启动。用户环境变量 `ASTROGATE_IMG_SSH_HOST` 指定已有 SSH 配置中的源站主机，`ASTROGATE_IMG_SSH_REMOTE_PORT` 指定服务端口，启动器会建立仅绑定本机的 SSH 隧道，避免公网入口的中转上传；也可继续使用原有的 `-SshHost`、`-RemotePort`、`-TunnelPort` 参数。凭据仍由独立图片密钥配置读取；不配置 SSH 主机时沿用 HTTPS 接口。
+本机可用 `powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\custom_nodes\astrogate\start.ps1 -Port 8190` 启动，脚本策略仅对本次进程生效。用户环境变量 `ASTROGATE_IMG_SSH_HOST` 指定已有 SSH 配置中的源站主机，`ASTROGATE_IMG_SSH_REMOTE_PORT` 指定服务端口，启动器会建立仅绑定本机的 SSH 隧道，避免公网入口的中转上传；也可继续使用原有的 `-SshHost`、`-RemotePort`、`-TunnelPort` 参数。凭据仍由独立图片密钥配置读取；不配置 SSH 主机时沿用 HTTPS 接口。
 
 `AstroGateStoryboardFrame` 是 V3 输出节点，IMAGE 输出可继续连接原生预览、保存、放大或其他生成节点。剧情和所属脚本接口使用惰性元数据连线；只有未完成图像任务才请求参考 IMAGE 输入。已导入的原生 LoadImage 也可直接接入参考口。单独自由生图仍使用原有 `AstroGateImage`。
 
