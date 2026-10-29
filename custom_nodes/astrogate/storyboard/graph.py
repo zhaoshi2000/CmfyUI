@@ -59,6 +59,11 @@ def render_prompt(snap, refs):
     else:
         lines = [snap["shot"]["image_prompt"]]
     lines.append("画风：" + snap["settings"]["style"])
+    if "asset_description" not in snap["shot"]:
+        camera = "，".join(str(snap["shot"].get(key) or "") for key in ("shot_size", "camera_angle", "frozen_moment")).strip("，")
+        if camera:
+            lines.append("本镜拍摄要求：" + camera + "。景别必须落实到画面裁切：脸部特写只表现脸部及必要背景，手或物品特写以关键细节为主体，不为了容纳人物参考图而退回全景。")
+        lines.append("人物设定图只参考身份、体貌和指定造型，不参考设定卡的全身构图或多视图排版。每镜按照本镜景别与机位重新取景，可以切换特写、反打、过肩或细节镜头，不机械重复前镜构图。")
     lines += snap["descriptions"] + snap["people"]
     if snap["shot"].get("atmosphere"):
         lines.append("本镜特效与氛围：" + snap["shot"]["atmosphere"])

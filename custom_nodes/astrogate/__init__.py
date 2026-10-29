@@ -96,7 +96,20 @@ def output_dimensions(aspect_ratio, resolution):
     return max(2, round(edge * width / height / 2) * 2), edge
 
 
-def encode_references(reference_images, max_images=8):
+def encode_reference(image, image_format=None):
+    image_format = image_format or os.environ.get("ASTROGATE_REFERENCE_FORMAT", "jpeg").strip().lower()
+    if image_format not in ("jpeg", "jpg", "png"):
+        raise ValueError("ASTROGATE_REFERENCE_FORMAT 请选择 jpeg 或 png。")
+    image_format = "png" if image_format == "png" or image.mode not in ("RGB", "L") else "jpeg"
+    with BytesIO() as buffer:
+        if image_format == "png":
+            image.save(buffer, format="PNG")
+        else:
+            image.save(buffer, format="JPEG", quality=95, subsampling=0)
+        return buffer.getvalue(), image_format
+
+
+def encode_references(reference_images, max_images=8, image_format=None):
     batches = [batch for batch in (reference_images or {}).values() if batch is not None]
     if max_images is not None and sum(batch.shape[0] for batch in batches) > max_images:
         raise ValueError("AstroGate 最多支持 8 张参考图，包含输入批次中的所有图片。")
@@ -107,13 +120,11 @@ def encode_references(reference_images, max_images=8):
             if tensor.shape[0] * tensor.shape[1] > 24_000_000:
                 raise ValueError("单张参考图不能超过 2400 万像素，请先连接图像缩放节点。")
             array = np.clip(tensor.detach().cpu().numpy() * 255, 0, 255).round().astype(np.uint8)
-            with BytesIO() as buffer:
-                Image.fromarray(array).save(buffer, format="PNG")
-                data = buffer.getvalue()
+            data, encoding = encode_reference(Image.fromarray(array), image_format)
             total_bytes += len(data)
             if len(data) > 32 * 1024 * 1024 or total_bytes > 50 * 1024 * 1024:
                 raise ValueError("参考图单张不能超过 32 MB，合计不能超过 50 MB。")
-            images.append({"b64_json": base64.b64encode(data).decode("ascii"), "filename": f"reference-{len(images) + 1}.png", "mime_type": "image/png"})
+            images.append({"b64_json": base64.b64encode(data).decode("ascii"), "filename": f"reference-{len(images) + 1}.{encoding}", "mime_type": f"image/{encoding}"})
     return images
 
 
@@ -137,9 +148,8 @@ def pack_character_views(images, refs):
             if sheet.width * sheet.height > 24_000_000:
                 scale = (24_000_000 / (sheet.width * sheet.height)) ** 0.5
                 sheet = sheet.resize((int(sheet.width * scale), int(sheet.height * scale)), Image.Resampling.LANCZOS)
-            buffer = BytesIO()
-            sheet.save(buffer, format="PNG")
-        packed.append({"b64_json": base64.b64encode(buffer.getvalue()).decode(), "filename": f"character-{index}.png", "mime_type": "image/png"})
+            data, encoding = encode_reference(sheet)
+        packed.append({"b64_json": base64.b64encode(data).decode(), "filename": f"character-{index}.{encoding}", "mime_type": f"image/{encoding}"})
         purposes.append({**refs[front_index], "purpose": refs[front_index]["purpose"] + "；同一人物双视图图册：左半为正视，右半为左视，不能画成两个人。"})
         consumed.add(pair)
     groups = {}
@@ -187,9 +197,8 @@ def reference_sheet(images):
         x, y = (index % columns) * width, (index // columns) * height
         sheet.paste(image, (x, y + header))
         draw.text((x + 4, y), str(index + 1), fill="black", font=font)
-    buffer = BytesIO()
-    sheet.save(buffer, format="PNG")
-    return {"b64_json": base64.b64encode(buffer.getvalue()).decode(), "filename": "reference-atlas.png", "mime_type": "image/png"}
+    data, encoding = encode_reference(sheet)
+    return {"b64_json": base64.b64encode(data).decode(), "filename": f"reference-atlas.{encoding}", "mime_type": f"image/{encoding}"}
 
 
 def image_timeout():
@@ -468,7 +477,7 @@ class AstroGateStoryboardFrame(io.ComfyNode):
         if job["status"] not in ("prepared", "queued"):
             raise RuntimeError("此任务不能重复发送。请查看任务状态；结果未知时不会自动重试。")
         ordered = dict(sorted((reference_images or {}).items(), key=lambda item: int(item[0].rsplit("_", 1)[1])))
-        references = encode_references(ordered, max_images=None if job.get("native") else 8)
+        references = encode_references(ordered, max_images=None if job.get("native") else 8, image_format=None if job.get("native") else "png")
         expected = job["references"]
         if job.get("native"):
             resolved = []
@@ -504,7 +513,7 @@ class AstroGateStoryboardFrame(io.ComfyNode):
         if job.get("native"):
             references, request_refs = pack_character_views(references, expected)
         if len(references) > 8:
-            raise ValueError("人物双视图合并后仍超过接口的8张参考图限制，请减少本镜不必要的素材引用。")
+            raise ValueError("本镜超过接口的8张参考图限制，请只连接必要的出镜人物或整理手动参考图。")
         width, height = output_dimensions(settings["aspect_ratio"], settings["resolution"])
         payload = {"model": "gpt-image-2", "prompt": job["prompt"], "size": f"{width}x{height}", "quality": settings["quality"],
                    "n": 1, "stream": False, "response_format": "b64_json", "gateway_request_id": job["gateway_request_id"]}

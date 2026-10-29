@@ -26,11 +26,13 @@ SHOT_PROMPT = """你是小说分镜师，把指定正文拆成可单独绘制的
 只分析本次段落，不重复摘要中的剧情。保持情节、时间与因果，不为了镜头数遗漏关键动作。participants只包含画面实际可见的人物；仅提及、画外音和对白提及者放mentioned，不自动画入。空镜允许空数组。
 人物character_id、look_id、scene_id和prop_ids只能来自known_assets。look须属于该人物，按故事时点选择造型；没有造型填null，不能编ID。缺少资产写missing_assets。若无适用场景scene_id为null。
 输入generate_prop_assets为false时prop_ids必须为空数组，不为普通物品要求独立素材或列missing_assets；仍根据原文与已知物品设定，在image_prompt中写清重要物品的形状、材质、位置、朝向和人物使用动作，保持前后镜一致。为true时仅按本镜实际可见情况绑定已知prop资产，不能因有素材就画入。
-image_prompt用中文描述冻结瞬间、可见主体、各自位置动作朝向、场景、景别、机位、光线、风格，不写图1等图序、不把对白字幕画入。多个人物须分别描述，人物左右与画面左右区分。未明示的视觉补全列inferred_details。
+按剧情需要设计电影镜头覆盖：新场景可用一次全景交代空间，随后用中景对话、正反打、过肩、面部近景与特写、关键物品或手部插入镜头表现信息与反应。关键微动作（取出、握紧、递交、触碰物品，眼神或表情变化）必须安排能看清该动作的近景或特写；不要连续重复同一全景、固定24mm或全员同框，也不要机械轮换景别、添加与正文无关的镜头。
+shot_size和camera_angle逐镜独立选择，image_prompt必须明确写出所选景别、实际机位、画面裁切范围和frozen_moment。特写时明确只保留脸、手或物品等本镜主体，允许人物身体和大部分环境出画，不要求完整展示整个空间或人物全身。场景母图的24mm全景只用于空间参考，不决定分镜的景别、焦段或裁切；换机位仍保持建筑、家具和光源在同一空间中的相对关系。
+image_prompt用中文描述冻结瞬间、实际可见主体、各自位置动作朝向、所需背景、景别、机位、光线、风格，不写图1等图序、不把对白字幕画入。participants按本镜裁切后的实际出场选择，不因同场景中有多个人就全部画入；纯物品特写可以为空，手部特写只列身份确定且手部实际可见的人物，并说明仅手部入画，不额外补全脸或全身。人物设定卡中的头像、正面、侧面、背面是同一个人的参考视图，不是多个人。多个人物须分别描述，人物左右与画面左右区分。未明示的视觉补全列inferred_details。
 atmosphere用简短中文记录本镜实际可见的天气、烟火、雾、魔法效果或需要的视觉氛围；没有则填空字符串。只写服务于该镜的效果，不凭空添加影响剧情的特效。统一画风使用输入的visual_style，不生成额外画风图片。
-source_refs只能是输入段落ID和逐字连续摘自该段原文的短摘，不能拼接或改写，无法逐字引用时quote填null。同场景、连续时间的相邻镜头默认参考前一张图，previous_local_id填写前一镜local_id，附previous_reason，continue_previous为true；转场、跳时、回忆或需要独立构图时为false且previous_local_id为null，改用对应人物、场景和道具素材。同一连续时段的story_time使用一致表述。输入previous_shot是本章上一块已完成的最后一镜，仅供承接，不重复生成；需要引用时使用其local_id。应用负责分配实际图片顺序与节点。
+source_refs只能是输入段落ID和逐字连续摘自该段原文的短摘，不能拼接或改写，无法逐字引用时quote填null。默认只把本镜实际出镜人物的设定卡作为图片参考，场景、服装变化和前情通过文字描述；previous_local_id为null、continue_previous为false，允许每镜独立选择景别与构图。需要额外图像参考时由用户在画布手动连线，不因保持人物、场景或剧情一致就锁定前镜图片。同一连续时段的story_time使用一致表述。输入previous_shot是本章上一块最后一镜的文字前情，仅供剧情承接，不重复生成或照搬其构图。应用负责分配实际图片顺序与节点。
 另外为有叙事联系的镜头提供story_parent_local_id（本次更早镜头local_id，无关联为null）和story_relation（如动作延续、对话回应、转场、时间推进、回忆）。剧情关联与图像参考独立，不因剧情有关就强制沿用上一帧图片。描写每镜的空间布局、前中后景、表情动作、光源和必要道具，使独立帧也能表达关键剧情。
-输出格式：{"shots":[{"local_id":"s1","summary":"镜头标题","source_refs":[{"paragraph_id":"输入ID","quote":null}],"story_time":"时间","scene_id":null,"participants":[{"character_id":"已知ID","look_id":null,"visible":true,"screen_position":"画面左侧","action":"动作","expression":"表情","facing":"朝向"}],"prop_ids":[],"shot_size":"中景","camera_angle":"平视","frozen_moment":"瞬间","atmosphere":"本镜视觉效果与氛围，可为空","dialogue":[],"narration":[],"mentioned":[],"image_prompt":"提示词","continue_previous":true,"previous_local_id":null,"previous_reason":"","story_parent_local_id":null,"story_relation":"","inferred_details":[],"uncertainties":[],"missing_assets":[]}],"summary":"本块情节摘要，不超过600字"}。"""
+输出格式：{"shots":[{"local_id":"s1","summary":"镜头标题","source_refs":[{"paragraph_id":"输入ID","quote":null}],"story_time":"时间","scene_id":null,"participants":[{"character_id":"已知ID","look_id":null,"visible":true,"screen_position":"画面左侧","action":"动作","expression":"表情","facing":"朝向"}],"prop_ids":[],"shot_size":"本镜选定景别","camera_angle":"本镜实际机位","frozen_moment":"瞬间","atmosphere":"本镜视觉效果与氛围，可为空","dialogue":[],"narration":[],"mentioned":[],"image_prompt":"包含景别、机位、裁切与冻结瞬间的提示词","continue_previous":false,"previous_local_id":null,"previous_reason":"","story_parent_local_id":null,"story_relation":"","inferred_details":[],"uncertainties":[],"missing_assets":[]}],"summary":"本块情节摘要，不超过600字"}。"""
 
 
 async def read_text_stream(response, on_progress=None):
@@ -223,20 +225,12 @@ def merge_shots(project, chapter_id, draft, paragraph_ids, analysis_id):
         shot.update(id=shot_id, chapter_id=chapter_id, revision=1, stale=True, analysis_id=analysis_id,
                     participants=people, scene=binding(project, candidate["scene_id"]) if candidate.get("scene_id") else None,
                     props=[binding(project, p) for p in candidate.get("prop_ids", [])], previous_shot_id=local_ids.get(previous))
-        if not previous and preceding and candidate.get("continue_previous") is not False:
-            same_scene = shot["scene"] and preceding.get("scene") and shot["scene"]["asset_id"] == preceding["scene"]["asset_id"]
-            same_time = (shot.get("story_time") or "") == (preceding.get("story_time") or "")
-            transition = any(word in str(shot.get("story_relation", "")) for word in ("转场", "跳时", "时间推进", "回忆", "闪回", "梦境"))
-            if same_scene and same_time and not transition:
-                shot["previous_shot_id"] = preceding["id"]
-                shot["previous_reason"] = shot.get("previous_reason") or "同场景连续镜头，延续空间与光线"
         story_parent = candidate.get("story_parent_local_id")
         if story_parent and (story_parent not in local_ids or local_ids[story_parent] == shot_id):
             raise ValueError("AI 的剧情关联不存在或指向自身。")
         shot["story_parent_id"] = local_ids.get(story_parent)
         validate_shot(project, shot)
         project["shots"].append(shot)
-        preceding = shot
 
 
 async def analyse(store, job_id):

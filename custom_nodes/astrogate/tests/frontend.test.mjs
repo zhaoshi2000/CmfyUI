@@ -618,6 +618,26 @@ test('sheet migration removes old side cards and default props while preserving 
     mountGraph(board,next,true);
     assert.equal(board.properties.astrogate_previous_asset_layout.nodes.length,3);
     assert.ok(sources(shot).includes(manual));
+    const peopleOnly={...next,layout_version:4,reference_wiring_version:4,character_aliases:{look:'actor'},
+        nodes:next.nodes.filter(item=>item.id!=='look').map(item=>({...item,properties:{...item.properties,astrogate_layout_version:4,
+            ...(item.id==='actor'?{astrogate_look_id:'look',astrogate_look_version:'look-v1'}:{})}})),
+        links:[wire('actor','shot',1)]};
+    mountGraph(board,peopleOnly,true);
+    assert.equal(graph._nodes.some(node=>node.properties.astrogate_kind==='look'),false);
+    assert.deepEqual(sources(shot),[actor,manual]);
+    assert.equal(actor.properties.astrogate_look_id,'look');
+    assert.equal(actor.properties.astrogate_look_version,'look-v1');
+    assert.equal(board.properties.astrogate_previous_asset_layout.nodes.length,4);
+    assert.equal(shot.properties.astrogate_images[0].filename,'shot.png');
+    assert.equal(changed(shot),false);
+    shot.addInput('board','ASTROGATE_BOARD');board.connect(0,shot,shot.findInputSlot('board'));
+    const rewritten={...peopleOnly,replace_shots:true,nodes:peopleOnly.nodes.map(item=>item.id==='shot'?{...item,id:'shot-new',
+        properties:{...item.properties,astrogate_key:'shot-new',astrogate_owner:'shot-new'}}:item),links:[wire('actor','shot-new',1)]};
+    const current=mountGraph(board,rewritten,true).get('shot-new');
+    assert.equal(graph._nodes.includes(shot),false);
+    assert.ok(graph._nodes.includes(current));
+    const oldShot=board.properties.astrogate_previous_asset_layout.nodes.find(node=>node.properties.astrogate_key==='shot');
+    assert.equal(oldShot.properties.astrogate_images[0].filename,'shot.png');
 });
 
 test('existing chapter wiring waits for running image jobs before migration',async()=>{

@@ -23,6 +23,7 @@ def node(monkeypatch, tmp_path):
     spec.loader.exec_module(module)
     monkeypatch.setattr(module.AstroGateImage, "hidden", SimpleNamespace(unique_id=None), raising=False)
     monkeypatch.setenv("ASTROGATE_IMG_API_KEY", "test-only-key")
+    monkeypatch.delenv("ASTROGATE_REFERENCE_FORMAT", raising=False)
     monkeypatch.setattr(module, "KEY_FILE", tmp_path / "api-key")
     return module
 
@@ -244,13 +245,49 @@ async def test_reference_inputs_preserve_batch_order_and_switch_endpoint(node, a
         for item, expected in zip(body["images"], [0, 128, 255]):
             with Image.open(BytesIO(base64.b64decode(item["b64_json"]))) as image:
                 assert image.getpixel((0, 0))[0] == expected
-            assert item["mime_type"] == "image/png"
+            assert item["mime_type"] == "image/jpeg"
         return web.json_response(image_payload())
 
     await api_server(aiohttp_server, node, handle)
     references = {"reference_1": torch.zeros(1, 8, 8, 3), "reference_2": torch.stack([torch.full((8, 8, 3), 0.5), torch.ones(8, 8, 3)])}
     result = await node.AstroGateImage.execute("edit", "gpt-image-2", "1:1", "original", "low", references)
     assert result.result[0].shape == (1, 16, 24, 3)
+
+
+def test_full_resolution_reference_transport_is_smaller_without_resizing(node):
+    texture = np.random.default_rng(10).integers(0, 256, (270, 480, 3), dtype=np.uint8)
+    image = Image.fromarray(texture).resize((3840, 2160), Image.Resampling.BICUBIC)
+    compact, encoding = node.encode_reference(image)
+    lossless, _ = node.encode_reference(image, "png")
+    assert encoding == "jpeg"
+    assert len(compact) < len(lossless) * .5
+    with Image.open(BytesIO(compact)) as decoded:
+        assert decoded.format == "JPEG" and decoded.size == image.size
+        assert decoded.mode == "RGB"
+
+
+def test_lossless_reference_config_preserves_pixels(node, monkeypatch):
+    monkeypatch.setenv("ASTROGATE_REFERENCE_FORMAT", "png")
+    tensor = torch.arange(8 * 8 * 3).reshape(1, 8, 8, 3) / 255
+    encoded = node.encode_references({"reference_1": tensor})[0]
+    assert encoded["mime_type"] == "image/png" and encoded["filename"].endswith(".png")
+    with Image.open(BytesIO(base64.b64decode(encoded["b64_json"]))) as decoded:
+        np.testing.assert_array_equal(np.array(decoded), tensor[0].numpy() * 255)
+
+
+def test_reference_transparency_keeps_png(node):
+    tensor = torch.ones(1, 8, 8, 4)
+    tensor[..., 3] = .5
+    encoded = node.encode_references({"reference_1": tensor})[0]
+    assert encoded["mime_type"] == "image/png"
+    with Image.open(BytesIO(base64.b64decode(encoded["b64_json"]))) as decoded:
+        assert decoded.mode == "RGBA" and decoded.getpixel((0, 0))[3] == 128
+
+
+def test_unknown_reference_format_fails_before_request(node, monkeypatch):
+    monkeypatch.setenv("ASTROGATE_REFERENCE_FORMAT", "webp")
+    with pytest.raises(ValueError, match="jpeg.*png"):
+        node.encode_references({"reference_1": torch.ones(1, 8, 8, 3)})
 
 
 async def test_requested_resolution_is_sent_and_applied_to_output(node, aiohttp_server):

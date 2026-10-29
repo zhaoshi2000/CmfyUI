@@ -67,6 +67,7 @@ def test_scene_request_is_one_empty_continuous_environment_panorama(modules, pro
 
 def test_shot_references_interpret_sheet_as_one_person_and_preserve_scene_layout(modules, project):
     shot = copy.deepcopy(project['shots'][0])
+    shot.update(shot_size='手与钥匙的特写', camera_angle='俯拍', frozen_moment='钥匙触及地图的一瞬')
     prompt = modules.graph.render_prompt(modules.graph.snapshot(project, shot), [
         {'purpose': '林夏人物图册', 'asset_kind': 'character', 'asset_view': 'sheet'},
         {'purpose': '客栈全景母图', 'asset_kind': 'scene'},
@@ -77,5 +78,8 @@ def test_shot_references_interpret_sheet_as_one_person_and_preserve_scene_layout
     assert '家具相对位置与主光源保持一致' in prompt
     assert '按本镜调整机位和景别' in prompt
     assert '只画本镜列出的可见人物' in prompt
+    assert '本镜拍摄要求：手与钥匙的特写，俯拍，钥匙触及地图的一瞬' in prompt
+    assert '不为了容纳人物参考图而退回全景' in prompt
+    assert '不参考设定卡的全身构图或多视图排版' in prompt
     assert '一张16:9连续的场景全景母图' not in prompt
     assert '干净的纯白或浅灰单色' not in prompt

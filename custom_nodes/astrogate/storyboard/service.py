@@ -194,6 +194,8 @@ def register_routes(recover_image=None):
                                          parent[0]["version_id"] if parent else None)
                 if job.get("asset_view") == "sheet":
                     record["view_images"] = {"sheet": job["result_image"]}
+                    if job["snapshot"]["shot"].get("sheet_look"):
+                        record["sheet_look"] = job["snapshot"]["shot"]["sheet_look"]
             elif action == "workflow":
                 chapter_id = body["chapter_id"]
                 if chapter_id not in {c["id"] for c in p["chapters"]}:

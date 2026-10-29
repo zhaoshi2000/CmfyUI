@@ -373,15 +373,17 @@ function mountGraph(board, recipe, relayout = false) {
             node.pos = [board.pos[0] + item.pos[0], board.pos[1] + item.pos[1]];
             if (item.properties.astrogate_layout_version && node.properties.astrogate_layout_version !== item.properties.astrogate_layout_version) {
                 const editable = value(node, "prompt") === node.properties.astrogate_base_prompt;
-                if (item.properties.astrogate_view === "sheet" && node.properties.astrogate_view !== "sheet") {
-                    node.properties.astrogate_previous_view = {view: node.properties.astrogate_view || "", prompt: value(node, "prompt"),
+                if (item.properties.astrogate_view === "sheet" && (node.properties.astrogate_view !== "sheet" || recipe.layout_version >= 4)) {
+                    const previous = {view: node.properties.astrogate_view || "", prompt: value(node, "prompt"),
                         job_id: value(node, "job_id"), images: node.properties.astrogate_images || []};
+                    if (node.properties.astrogate_previous_view) (node.properties.astrogate_previous_views ||= []).push(previous);
+                    else node.properties.astrogate_previous_view = previous;
                     setValue(node, "prompt", editable ? item.widgets.prompt : `${value(node, "prompt")}\n${item.widgets.prompt}`);
                 } else if (item.properties.astrogate_kind === "character" && !node.properties.astrogate_view) {
                     if (editable) { setValue(node, "prompt", item.widgets.prompt); node.properties.astrogate_base_prompt = item.widgets.prompt; }
                     setValue(node, "job_id", item.widgets.job_id);
                 }
-                for (const key of ["astrogate_view", "astrogate_layout_version", "astrogate_reference_purpose", "astrogate_prompt_folded"]) node.properties[key] = item.properties[key];
+                for (const key of ["astrogate_view", "astrogate_layout_version", "astrogate_reference_purpose", "astrogate_prompt_folded", "astrogate_look_id", "astrogate_look_version"]) node.properties[key] = item.properties[key];
                 node.title = item.title;
                 if (editable && !value(node, "job_id")) { setValue(node, "prompt", item.widgets.prompt); node.properties.astrogate_base_prompt = item.widgets.prompt; }
                 if (["character", "look", "scene", "scene_state"].includes(item.properties.astrogate_kind)) setValue(node, "aspect_ratio", item.widgets.aspect_ratio);
@@ -398,18 +400,20 @@ function mountGraph(board, recipe, relayout = false) {
         const target = mapping.get(link.to);
         const source = mapping.get(link.from);
         // Restoring or arranging a chapter preserves manually edited wires and prompts.
-        if (created.has(target) || (upgrade.has(target) && recipe.layout_version !== 3)) connect(source, link.slot, target, link.input, link.type);
-        else if (recipe.layout_version === 3 && link.type === "IMAGE" && created.has(source) && !imageSources(target).some(ref => ref.node === source)) {
+        if (created.has(target) || (upgrade.has(target) && !(recipe.layout_version >= 3))) connect(source, link.slot, target, link.input, link.type);
+        else if (recipe.layout_version >= 3 && link.type === "IMAGE" && created.has(source) && !imageSources(target).some(ref => ref.node === source)) {
             let index = Number(link.input.split("_").at(-1));
             while (sourceNode(target, `reference_images.reference_${index}`)) index++;
             connect(source, link.slot, target, `reference_images.reference_${index}`, link.type);
         }
     }
-    if (recipe.layout_version === 3) {
+    if (recipe.layout_version >= 3) {
         const wanted = new Set(recipe.nodes.map(item => item.id));
         const obsolete = nodes().filter(node => node.type === "AstroGateStoryboardFrame" && node.properties.astrogate_project === recipe.project_id &&
             node.properties.astrogate_chapter === recipe.chapter_id && !wanted.has(node.properties.astrogate_key) &&
-            (node.properties.astrogate_key?.endsWith("::left") || node.properties.astrogate_kind === "prop"));
+            (node.properties.astrogate_key?.endsWith("::left") || node.properties.astrogate_kind === "prop" ||
+                (recipe.layout_version >= 4 && node.properties.astrogate_kind === "look") ||
+                (recipe.replace_shots && node.properties.astrogate_kind === "shot" && sourceNode(node, "board") === board)));
         if (obsolete.length) {
             const ids = new Set(obsolete.map(node => node.id));
             const archive = board.properties.astrogate_previous_asset_layout ||= {nodes: [], links: []};
@@ -419,10 +423,11 @@ function mountGraph(board, recipe, relayout = false) {
             for (const target of nodes().filter(node => !ids.has(node.id))) {
                 const unchanged = !changed(target);
                 for (const ref of imageSources(target).filter(ref => ids.has(ref.node.id))) {
-                    const sheet = mapping.get(ref.node.properties.astrogate_key.replace(/::left$/, ""));
+                    const key = recipe.character_aliases?.[ref.node.properties.astrogate_key] || ref.node.properties.astrogate_key.replace(/::left$/, "");
+                    const sheet = mapping.get(key) || nodes().find(node => node.properties.astrogate_key === key && node.properties.astrogate_project === recipe.project_id);
                     const choice = referenceChoice(target, ref);
                     const duplicate = sheet && imageSources(target).some(other => other.node === sheet && referenceChoice(target, other).role === choice.role);
-                    if (sheet && (!duplicate || choice.role !== "auto" || choice.detail)) {
+                    if (sheet && sheet !== target && !ids.has(sheet.id) && (!duplicate || choice.role !== "auto" || choice.detail)) {
                         connect(sheet, 0, target, ref.slot, "IMAGE");
                         const saved = target.properties.astrogate_reference_roles?.[ref.slot];
                         if (saved) saved.source = String(sheet.id);
@@ -431,6 +436,19 @@ function mountGraph(board, recipe, relayout = false) {
                 if (unchanged && target.properties.astrogate_signature) target.properties.astrogate_signature = nodeSignature(target);
             }
             for (const node of obsolete) app.graph.remove(node);
+        }
+    }
+    if (recipe.layout_version >= 4 && board.properties.astrogate_wiring_version !== recipe.reference_wiring_version) {
+        for (const item of recipe.nodes.filter(item => item.properties.astrogate_kind === "shot")) {
+            const target = mapping.get(item.id), unchanged = !changed(target);
+            for (const ref of imageSources(target)) {
+                const choice = referenceChoice(target, ref);
+                if (ref.node.type === "AstroGateStoryboardFrame" && ref.node.properties.astrogate_kind !== "character" && choice.role === "auto" && !choice.detail) {
+                    target.disconnectInput(target.findInputSlot(ref.slot));
+                }
+            }
+            if (unchanged && target.properties.astrogate_signature) target.properties.astrogate_signature = nodeSignature(target);
+            labelReferences(target);
         }
     }
     if (recipe.reference_wiring_version >= 2 && board.properties.astrogate_wiring_version !== recipe.reference_wiring_version) {
@@ -485,6 +503,7 @@ async function buildBoard(board, info, relayout = false) {
         board.properties.astrogate_board = info;
         await applyFrameAspect(board);
         const recipe = await request(`/projects/${info.project_id}/native/canvas`, info);
+        recipe.replace_shots = Boolean(previousAnalysis && previousAnalysis !== info.analysis_id);
         const layout = recipe.layout_version || 2;
         const migrating = previousAnalysis === info.analysis_id && (board.properties.astrogate_layout_version !== layout ||
             board.properties.astrogate_wiring_version !== recipe.reference_wiring_version);
@@ -495,10 +514,10 @@ async function buildBoard(board, info, relayout = false) {
         const frames = [...mapping.values()].filter(n => n.properties.astrogate_kind === "shot");
         const auto = frames.length && !migrating && board.properties.astrogate_autogenerate !== false && board.properties.astrogate_auto_started !== info.analysis_id;
         if (auto) board.properties.astrogate_auto_started = info.analysis_id;
-        message(board, `已建立 ${frames.length} 个分镜与人物设定卡、场景母图。${auto ? "正在自动生成图片…" : "可生成本章或选中图片。"}`);
+        message(board, `已建立 ${frames.length} 个分镜，每个人物一张设定卡。默认只参考出镜人物，场景与前情使用文字。${auto ? "正在自动生成图片…" : "可生成本章或选中图片。"}`);
         await saveBoard(board);
         if (frames.length) focusNode([...mapping.values()].find(n => n.properties.astrogate_view === "sheet") || frames[0]);
-        if (auto) await generate([...frames, ...[...mapping.values()].filter(n => n.properties.astrogate_view === "sheet")], false, board);
+        if (auto) await generate([...frames, ...[...mapping.values()].filter(n => n.properties.astrogate_kind === "character")], false, board);
     })();
     try { return await board.agBuilding; }
     finally { delete board.agBuilding; }
@@ -610,6 +629,7 @@ async function generate(targets, force = false, reporter = targets[0]) {
         message(node, `准备生成 · ${refs.length} 路图片参考`, true);
         const job = await request(`/projects/${project}/native/prepare`, {owner_id: node.properties.astrogate_owner,
             version_id: node.properties.astrogate_version, view: node.properties.astrogate_view,
+            look_id: node.properties.astrogate_look_id, look_version_id: node.properties.astrogate_look_version,
             owner_type: node.properties.astrogate_owner_type || "shot", prompt: value(node, "prompt"), atmosphere: node.properties.astrogate_atmosphere || "",
             settings: {aspect_ratio: value(node, "aspect_ratio"), resolution: value(node, "resolution"), quality: value(node, "quality")},
             references: refs, story_parent_id: sourceNode(node, "story_context")?.properties.astrogate_owner || null, force: requested && force,
@@ -771,7 +791,10 @@ function installBoard(node) {
     node.agAnalysisButton = button(node, "分析并自动建立节点", () => startAnalysis(node), "primary");
     node.agRetryButton = button(node, "重试未完成分析", () => startAnalysis(node, true));
     node.agRetryButton.hidden = true;
-    controls.append(node.agAnalysisButton, node.agRetryButton, button(node, "恢复 / 整理节点排版", async () => {
+    controls.append(node.agAnalysisButton, node.agRetryButton, button(node, "重新拆镜（含特写）", () => {
+        setValue(node, "analysis_revision", Number(value(node, "analysis_revision")) + 1);
+        return startAnalysis(node);
+    }), button(node, "恢复 / 整理节点排版", async () => {
         const info = node.properties.astrogate_board;
         if (!info) throw new Error("请先分析剧本。");
         await buildBoard(node, info, true);
@@ -779,7 +802,7 @@ function installBoard(node) {
         const info = node.properties.astrogate_board;
         if (!info) throw new Error("请先分析剧本。");
         await generate(nodes().filter(n => n.properties.astrogate_project === info.project_id && n.properties.astrogate_chapter === info.chapter_id &&
-            (n.properties.astrogate_kind === "shot" || n.properties.astrogate_view === "sheet")), false, node);
+            (n.properties.astrogate_kind === "shot" || n.properties.astrogate_kind === "character")), false, node);
     }), button(node, "停止分析", async () => {
         const context = await analysisContext(node);
         const promptId = node.properties.astrogate_prompt_key === context.key ? node.properties.astrogate_prompt_id : null;
@@ -799,7 +822,7 @@ function installBoard(node) {
         a.download = "astrogate-storyboard.zip";
         a.click();
     }));
-    root.append(autoLabel, controls, progressBar(node), element("p", "人物设定卡、场景母图 → 分镜。素材默认 16:9，分镜使用统一画幅；物品仅在开启独立素材时生成。", "ag-hint"), node.agStatus);
+    root.append(autoLabel, controls, progressBar(node), element("p", "每个人物一张设定卡，分镜默认只参考出镜人物；场景和前情使用文字。支持全景、中景、反打与特写切换。", "ag-hint"), node.agStatus);
     node.size = [430, 650];
 }
 function installFrame(node) {
@@ -1070,7 +1093,7 @@ async function poll() {
                 batchProgress(node, jobs);
                 const busy = submitting || result.jobs.some(j => j.kind === "image" &&
                     (["running", "queued", "cancelling"].includes(j.status) || (j.status === "prepared" && j.prompt_id)));
-                if (job?.status === "succeeded" && !busy && (node.properties.astrogate_board?.analysis_id !== job.id || (!node.agLayoutChecked && node.properties.astrogate_layout_version !== 3) || !node.agWiringChecked)) {
+                if (job?.status === "succeeded" && !busy && (node.properties.astrogate_board?.analysis_id !== job.id || (!node.agLayoutChecked && node.properties.astrogate_layout_version !== 4) || !node.agWiringChecked)) {
                     delete node.properties.astrogate_resume_job;
                     await buildBoard(node, {project_id: project, chapter_id: job.chapter_id, analysis_id: job.id});
                 }
