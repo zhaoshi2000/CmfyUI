@@ -220,7 +220,8 @@ async def generate_image(payload, edit):
             async with session.post(f"{API_BASE}/images/{operation}", json=payload,
                                     headers={"Authorization": f"Bearer {key}"}, allow_redirects=False) as response:
                 if response.status != 200:
-                    hints = {401: "接口密钥无效", 403: "接口访问被拒绝", 409: "请求已提交，请稍后确认结果", 429: "接口繁忙或额度不足"}
+                    hints = {401: "接口密钥无效", 403: "接口访问被拒绝", 409: "请求已提交，请稍后确认结果", 429: "接口繁忙或额度不足",
+                             502: "图片上游异常，未返回完整结果", 504: "图片上游超时，结果未确认"}
                     raise RuntimeError(f"AstroGate HTTP {response.status}：{hints.get(response.status, '图片服务未完成请求')}。")
                 raw = bytearray()
                 async for chunk in response.content.iter_chunked(1024 * 1024):
@@ -301,7 +302,7 @@ async def recover_storyboard_image(store, job):
         if not isinstance(result, dict):
             raise ValueError("图片服务返回了无效查询结果，未重新生成。")
         status = result.get("status")
-        if status in ("pending", "missing", "expired", "unavailable"):
+        if status in ("pending", "unknown", "missing", "expired", "unavailable"):
             return {"status": status}
         if status != "succeeded":
             return {"status": "unavailable"}

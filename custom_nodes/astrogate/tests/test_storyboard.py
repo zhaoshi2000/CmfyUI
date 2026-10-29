@@ -1007,7 +1007,7 @@ async def test_native_frame_orders_actual_inputs_and_durably_reuses(modules, pro
     assert len(sent) == 1
 
 
-@pytest.mark.parametrize('status', ['succeeded','pending','missing','expired','unavailable'])
+@pytest.mark.parametrize('status', ['succeeded','pending','unknown','missing','expired','unavailable'])
 async def test_recover_result_only_queries_gateway_without_generating(modules, project, monkeypatch, tmp_path, aiohttp_server, status):
     native = sys.modules[modules.node.__name__ + '.storyboard.native']
     m = modules.node

@@ -337,6 +337,9 @@ test('unknown image recovery queries without regeneration and only shows a saved
     await recover.events.click();
     assert.match(node.agProgress.label.textContent,/尚未确认结果.*不会重复提交/);
     await poll();assert.match(node.agProgress.label.textContent,/尚未确认结果/);
+    status='unknown';await recover.events.click();
+    assert.match(node.agStatus.textContent,/请求已异常中断.*未重新生成.*重绘/);
+    await poll();assert.match(node.agProgress.label.textContent,/请求已异常中断/);
     status='missing';await recover.events.click();
     assert.match(node.agStatus.textContent,/未找到结果.*重绘/);
     status='expired';await recover.events.click();
@@ -347,7 +350,7 @@ test('unknown image recovery queries without regeneration and only shows a saved
     assert.equal(node.properties.astrogate_images[0].filename,'saved.png');
     assert.equal(node.agImage.hidden,false);assert.equal(recover.hidden,true);
     assert.equal(node.agProgress.bar.value,1);
-    assert.equal(calls.filter(([path])=>path.endsWith('/recover')).length,5);
+    assert.equal(calls.filter(([path])=>path.endsWith('/recover')).length,6);
     assert.equal(calls.some(([path])=>path==='/prompt'||path.endsWith('/native/prepare')),false);
 });
 
