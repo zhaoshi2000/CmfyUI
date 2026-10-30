@@ -29,10 +29,12 @@ SHOT_PROMPT = """你是小说分镜师，把指定正文拆成可单独绘制的
 按剧情需要设计电影镜头覆盖：新场景可用一次全景交代空间，随后用中景对话、正反打、过肩、面部近景与特写、关键物品或手部插入镜头表现信息与反应。关键微动作（取出、握紧、递交、触碰物品，眼神或表情变化）必须安排能看清该动作的近景或特写；不要连续重复同一全景、固定24mm或全员同框，也不要机械轮换景别、添加与正文无关的镜头。
 shot_size和camera_angle逐镜独立选择，image_prompt必须明确写出所选景别、实际机位、画面裁切范围和frozen_moment。特写时明确只保留脸、手或物品等本镜主体，允许人物身体和大部分环境出画，不要求完整展示整个空间或人物全身。场景母图的24mm全景只用于空间参考，不决定分镜的景别、焦段或裁切；换机位仍保持建筑、家具和光源在同一空间中的相对关系。
 image_prompt用中文描述冻结瞬间、实际可见主体、各自位置动作朝向、所需背景、景别、机位、光线、风格，不写图1等图序、不把对白字幕画入。participants按本镜裁切后的实际出场选择，不因同场景中有多个人就全部画入；纯物品特写可以为空，手部特写只列身份确定且手部实际可见的人物，并说明仅手部入画，不额外补全脸或全身。人物设定卡中的头像、正面、侧面、背面是同一个人的参考视图，不是多个人。多个人物须分别描述，人物左右与画面左右区分。未明示的视觉补全列inferred_details。
+video_action单独描述从本镜关键帧开始的可拍摄动作、人物走位、表情变化和摄影机运动；按剧情切换全景、中景、近景、反打或特写，不连续重复同一机位。不能把人物设定卡的多视图当作多个角色，也不能让未出镜的说话人入画。sound_cues只列正文支持的现场环境音或动作声，不能编造BGM；不生成字幕、屏幕文字、水印。台词只通过dialogue_refs关联，不在video_action里重复写整句。原文没有时长时不编造秒数、语速或音频时间轴。
 atmosphere用简短中文记录本镜实际可见的天气、烟火、雾、魔法效果或需要的视觉氛围；没有则填空字符串。只写服务于该镜的效果，不凭空添加影响剧情的特效。统一画风使用输入的visual_style，不生成额外画风图片。
 source_refs只能是输入段落ID和逐字连续摘自该段原文的短摘，不能拼接或改写，无法逐字引用时quote填null。默认只把本镜实际出镜人物的设定卡作为图片参考，场景、服装变化和前情通过文字描述；previous_local_id为null、continue_previous为false，允许每镜独立选择景别与构图。需要额外图像参考时由用户在画布手动连线，不因保持人物、场景或剧情一致就锁定前镜图片。同一连续时段的story_time使用一致表述。输入previous_shot是本章上一块最后一镜的文字前情，仅供剧情承接，不重复生成或照搬其构图。应用负责分配实际图片顺序与节点。
 另外为有叙事联系的镜头提供story_parent_local_id（本次更早镜头local_id，无关联为null）和story_relation（如动作延续、对话回应、转场、时间推进、回忆）。剧情关联与图像参考独立，不因剧情有关就强制沿用上一帧图片。描写每镜的空间布局、前中后景、表情动作、光源和必要道具，使独立帧也能表达关键剧情。
-输出格式：{"shots":[{"local_id":"s1","summary":"镜头标题","source_refs":[{"paragraph_id":"输入ID","quote":null}],"story_time":"时间","scene_id":null,"participants":[{"character_id":"已知ID","look_id":null,"visible":true,"screen_position":"画面左侧","action":"动作","expression":"表情","facing":"朝向"}],"prop_ids":[],"shot_size":"本镜选定景别","camera_angle":"本镜实际机位","frozen_moment":"瞬间","atmosphere":"本镜视觉效果与氛围，可为空","dialogue":[],"narration":[],"mentioned":[],"image_prompt":"包含景别、机位、裁切与冻结瞬间的提示词","continue_previous":false,"previous_local_id":null,"previous_reason":"","story_parent_local_id":null,"story_relation":"","inferred_details":[],"uncertainties":[],"missing_assets":[]}],"summary":"本块情节摘要，不超过600字"}。"""
+台词与镜头分开：dialogues只列本块新台词，每句话只创建一条；shot.dialogue_refs可引用本块dialogues的local_id，或输入recent_dialogues中的已有id。跨镜头的一句话分别用引用标明文字区间，不重复创建。原文直接对白保持原文，source填original，text必须逐字出现在本次段落；改编或补充的台词填adapted且待确认。character_id只能是已知character ID，未知为null；画外说话不增加participants。台词与音频不提供时间。source_refs仍定位本块段落。start/end为Unicode码点的零起始、前闭后开区间；不确定时均为null并设置needs_review=true。mode取start/continue/audio_only/finish，纯声音延续show_subtitle=false。没有台词返回空数组。
+输出格式：{"dialogues":[{"local_id":"d1","character_id":null,"type":"dialogue|narration|voiceover|inner","text":"台词全文","source":"original|adapted","source_refs":[{"paragraph_id":"输入ID","quote":null}],"emotion":"","tone":""}],"shots":[{"local_id":"s1","summary":"镜头标题","source_refs":[{"paragraph_id":"输入ID","quote":null}],"story_time":"时间","scene_id":null,"participants":[{"character_id":"已知ID","look_id":null,"visible":true,"screen_position":"画面左侧","action":"动作","expression":"表情","facing":"朝向"}],"prop_ids":[],"shot_size":"本镜选定景别","camera_angle":"本镜实际机位","frozen_moment":"瞬间","video_action":"镜内动作与运镜","sound_cues":["有原文依据的现场声音"],"atmosphere":"本镜视觉效果与氛围，可为空","dialogue_refs":[{"dialogue_id":"d1","start":0,"end":2,"mode":"start","show_subtitle":true,"needs_review":false}],"dialogue":[],"narration":[],"mentioned":[],"image_prompt":"包含景别、机位、裁切与冻结瞬间的提示词","continue_previous":false,"previous_local_id":null,"previous_reason":"","story_parent_local_id":null,"story_relation":"","inferred_details":[],"uncertainties":[],"missing_assets":[]}],"summary":"本块情节摘要，不超过600字"}。"""
 
 
 async def read_text_stream(response, on_progress=None):
@@ -41,9 +43,8 @@ async def read_text_stream(response, on_progress=None):
     characters, started = 0, False
     last_report = time.monotonic()
     async for line in response.content:
-        size += len(line)
-        if size > 4 * 1024 * 1024:
-            raise RuntimeError("文本响应超过4MB，请缩小分析范围。")
+        if len(line) > 4 * 1024 * 1024:
+            raise RuntimeError("单条文本流事件超过4MB，请缩小分析范围。")
         if on_progress and time.monotonic() - last_report >= 2:
             on_progress(None, received_chars=characters, last_activity_at=time.time())
             last_report = time.monotonic()
@@ -66,6 +67,9 @@ async def read_text_stream(response, on_progress=None):
                 continue
             content = choice.get("delta", {}).get("content")
             if content:
+                size += len(content.encode("utf-8"))
+                if size > 4 * 1024 * 1024:
+                    raise RuntimeError("文本正文超过4MB，请缩小分析范围。")
                 parts.append(content)
                 characters += len(content)
                 if on_progress and not started:
@@ -93,7 +97,8 @@ async def text_request(model, system, content, on_progress=None):
         body["reasoning_effort"] = "xhigh"
     try:
         timeout = float(os.environ.get("ASTROGATE_TEXT_TIMEOUT", "900"))
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout, connect=15), trust_env=False) as session:
+        idle_timeout = float(os.environ.get("ASTROGATE_TEXT_IDLE_TIMEOUT", "180"))
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout, connect=15, sock_read=idle_timeout), trust_env=False) as session:
             async with session.post(f"{TEXT_BASE}/chat/completions", json=body,
                                     headers={"Authorization": f"Bearer {key}"}, allow_redirects=False) as response:
                 if on_progress:
@@ -163,12 +168,18 @@ def known_assets(project, text=""):
     return result
 
 
-def merge_assets(project, draft, paragraph_ids):
+def merge_assets(project, draft, paragraph_ids, section=None):
     mapping = {a["id"]: a["id"] for a in project["assets"]}
     for candidate in draft["assets"]:
         if candidate["kind"] not in ("character", "look", "scene", "scene_state", "prop"):
             raise ValueError("未知素材类别。")
-        check_sources(project, candidate["source_refs"], paragraph_ids)
+        refs = candidate["source_refs"]
+        for ref in refs:
+            if isinstance(ref, dict) and ref.get("paragraph_id") not in paragraph_ids and ref.get("quote"):
+                matches = {p["id"] for p in (section or []) if ref["quote"] in p["text"]}
+                if len(matches) == 1:
+                    ref["paragraph_id"] = next(iter(matches))
+        check_sources(project, refs, paragraph_ids)
         existing = candidate.get("existing_id")
         if existing:
             asset = asset_by_id(project, existing)
@@ -198,20 +209,83 @@ def preceding_shot(project, chapter_id, analysis_id):
     return next((s for s in reversed(project["shots"]) if s["chapter_id"] == chapter_id and s.get("analysis_id") == analysis_id), None)
 
 
-def merge_shots(project, chapter_id, draft, paragraph_ids, analysis_id):
+def merge_shots(project, chapter_id, draft, paragraph_ids, analysis_id, section=None):
     preceding = preceding_shot(project, chapter_id, analysis_id)
     local_ids = {"previous_chunk": preceding["id"]} if preceding else {}
+    dialogues = project.setdefault("dialogues", [])
+    recent = [d for d in dialogues if d["chapter_id"] == chapter_id and d.get("analysis_id") == analysis_id][-8:]
+    dialogue_ids = {d["id"]: d for d in recent}
+    for candidate in draft.get("dialogues", []):
+        local_id = candidate["local_id"]
+        if local_id in dialogue_ids:
+            raise ValueError("AI 返回重复台词 ID。")
+        refs = candidate["source_refs"]
+        check_sources(project, refs, paragraph_ids)
+        text = candidate["text"]
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("AI 返回了空台词。")
+        source = candidate.get("source")
+        if source not in ("original", "adapted"):
+            raise ValueError("AI 返回了无效台词来源。")
+        if source == "original":
+            paragraphs = {p["id"]: p["text"] for c in project["chapters"] for p in c["paragraphs"]}
+            source_text = section if section is not None else [{"id": key, "text": value} for key, value in paragraphs.items()]
+            if not any(text in p["text"] for p in source_text if p["id"] in {ref["paragraph_id"] for ref in refs}):
+                raise ValueError("AI 原文台词与原文不符，请修正草稿。")
+        kind = candidate.get("type")
+        if kind not in ("dialogue", "narration", "voiceover", "inner"):
+            raise ValueError("AI 返回了无效台词类型。")
+        character_id = candidate.get("character_id")
+        if character_id in ("", "null"):
+            character_id = None
+        speaker = asset_by_id(project, character_id) if character_id else None
+        unresolved_character_id = character_id if character_id and (speaker is None or speaker["kind"] != "character") else None
+        if unresolved_character_id:
+            character_id = None
+        matches = [d["id"] for d in dialogues if d.get("chapter_id") == chapter_id and d.get("text") == text
+                   and d.get("character_id") == character_id and
+                   set(ref["paragraph_id"] for ref in d.get("source_refs", [])) & set(ref["paragraph_id"] for ref in refs)]
+        dialogue = {"id": new_id(), "chapter_id": chapter_id, "analysis_id": analysis_id, "character_id": character_id,
+                    "type": kind, "text": text, "source": source, "source_refs": refs,
+                    "emotion": candidate.get("emotion") or "", "tone": candidate.get("tone") or "",
+                    "status": "pending", "revision": 1, "possible_matches": matches}
+        if unresolved_character_id:
+            dialogue["unresolved_character_id"] = unresolved_character_id
+        dialogue_ids[local_id] = dialogue
+        dialogues.append(dialogue)
     for candidate in draft["shots"]:
-        check_sources(project, candidate["source_refs"], paragraph_ids)
-        people = []
+        source_refs, unresolved_sources = [], []
+        refs = candidate["source_refs"]
+        if not isinstance(refs, list) or not refs or any(not isinstance(ref, dict) for ref in refs):
+            raise ValueError("分析条目缺少有效的原文定位。")
+        for ref in refs:
+            if ref.get("paragraph_id") in paragraph_ids:
+                source_refs.append(ref)
+                continue
+            quote = ref.get("quote")
+            matches = {p["id"] for p in (section or []) if quote and quote in p["text"]}
+            if len(matches) == 1:
+                source_refs.append({"paragraph_id": next(iter(matches)), "quote": quote})
+            else:
+                unresolved_sources.append(ref)
+        if source_refs:
+            check_sources(project, source_refs, paragraph_ids)
+        elif not unresolved_sources:
+            raise ValueError("分析条目缺少原文定位。")
+        people, unresolved_people = [], []
         for person in candidate["participants"]:
             if not isinstance(person, dict):
                 raise ValueError("AI 返回了无效人物结构，请修正草稿。")
             if person.get("visible") is not True:
                 raise ValueError("AI 将未出镜人物加入了画面，请修正草稿。")
+            character = asset_by_id(project, person.get("character_id"))
+            look = asset_by_id(project, person.get("look_id")) if person.get("look_id") else None
+            if character is None or character["kind"] != "character" or (look and (look["kind"] != "look" or look.get("parent_id") != character["id"])) or (person.get("look_id") and look is None):
+                unresolved_people.append(person)
+                continue
             people.append({k: person.get(k, "") for k in ("screen_position", "action", "expression", "facing")}
-                          | {"visible": True, "identity": binding(project, person["character_id"]),
-                             "look": binding(project, person["look_id"]) if person.get("look_id") else None})
+                          | {"visible": True, "identity": binding(project, character["id"]),
+                             "look": binding(project, look["id"]) if look else None})
         previous = candidate.get("previous_local_id") if candidate.get("continue_previous") is not False else None
         if previous and previous not in local_ids:
             raise ValueError("AI 的上一帧依赖不存在或顺序无效。")
@@ -219,11 +293,40 @@ def merge_shots(project, chapter_id, draft, paragraph_ids, analysis_id):
             raise ValueError("AI 返回重复镜头 local_id。")
         shot_id = new_id()
         local_ids[candidate["local_id"]] = shot_id
-        shot = {k: v for k, v in candidate.items() if k not in ("local_id", "scene_id", "prop_ids", "previous_local_id", "participants")}
+        shot = {k: v for k, v in candidate.items() if k not in ("local_id", "scene_id", "prop_ids", "previous_local_id", "participants", "dialogue_refs")}
+        shot["source_refs"] = source_refs
+        if unresolved_people:
+            shot["unresolved_participants"] = unresolved_people
+        if unresolved_sources:
+            shot["unresolved_source_refs"] = unresolved_sources
+            shot["source_refs_needs_review"] = True
+        links = []
+        for ref in candidate.get("dialogue_refs", []):
+            dialogue = dialogue_ids.get(ref["dialogue_id"])
+            if dialogue is None:
+                raise ValueError("AI 引用了不存在的台词。")
+            start, end = ref.get("start"), ref.get("end")
+            invalid_range = (start is None) != (end is None) or (start is not None and
+                             (type(start) is not int or type(end) is not int or not 0 <= start < end <= len(dialogue["text"])))
+            mode = ref.get("mode")
+            if mode not in ("start", "continue", "audio_only", "finish") or type(ref.get("show_subtitle")) is not bool:
+                raise ValueError("AI 返回了无效台词关联。")
+            links.append({"dialogue_id": dialogue["id"], "start": start, "end": end, "mode": mode,
+                          "show_subtitle": ref["show_subtitle"], "needs_review": invalid_range or bool(ref.get("needs_review")) or (start is None and mode != "audio_only") or bool(dialogue.get("possible_matches"))})
+        shot["dialogue_links"] = links
+        if not isinstance(candidate.get("video_action", ""), str) or not isinstance(candidate.get("sound_cues", []), list) or any(not isinstance(cue, str) for cue in candidate.get("sound_cues", [])):
+            raise ValueError("AI 返回了无效视频动作或现场声音。")
+        shot["video_action"] = candidate.get("video_action", "")
+        shot["sound_cues"] = candidate.get("sound_cues", [])
         atmosphere = candidate.get("atmosphere") or ""
         shot["atmosphere"] = "，".join(map(str, atmosphere)) if isinstance(atmosphere, list) else str(atmosphere)
+        scene_id = candidate.get("scene_id")
+        scene = asset_by_id(project, scene_id) if scene_id else None
+        if scene_id and (scene is None or scene["kind"] not in ("scene", "scene_state")):
+            shot["unresolved_scene_id"] = scene_id
+            scene_id = None
         shot.update(id=shot_id, chapter_id=chapter_id, revision=1, stale=True, analysis_id=analysis_id,
-                    participants=people, scene=binding(project, candidate["scene_id"]) if candidate.get("scene_id") else None,
+                    participants=people, scene=binding(project, scene_id) if scene_id else None,
                     props=[binding(project, p) for p in candidate.get("prop_ids", [])], previous_shot_id=local_ids.get(previous))
         story_parent = candidate.get("story_parent_local_id")
         if story_parent and (story_parent not in local_ids or local_ids[story_parent] == shot_id):
@@ -231,6 +334,8 @@ def merge_shots(project, chapter_id, draft, paragraph_ids, analysis_id):
         shot["story_parent_id"] = local_ids.get(story_parent)
         validate_shot(project, shot)
         project["shots"].append(shot)
+    if draft.get("dialogues") or any(s.get("dialogue_refs") for s in draft["shots"]):
+        project["dialogue_revision"] = project.get("dialogue_revision", 0) + 1
 
 
 async def analyse(store, job_id):
@@ -238,7 +343,7 @@ async def analyse(store, job_id):
     project_id = job["project_id"]
     project = store.get(project_id)
     chapter = next(c for c in project["chapters"] if c["id"] == job["chapter_id"])
-    sections = list(chunks(chapter["paragraphs"]))
+    sections = list(chunks(chapter["paragraphs"], limit=job.get("chunk_limit", 6000), prefer_sentences=job.get("sentence_chunks", False)))
     summary = job.get("summary", "")
     responses = job.get("responses", [])
     completed = job.get("completed_chunks", 0)
@@ -275,7 +380,7 @@ async def analyse(store, job_id):
             checkpoint = f"{job_id}:{index}:assets"
             if checkpoint not in project.get("analysis_checkpoints", []):
                 def apply_assets(p):
-                    merge_assets(p, extracted, ids)
+                    merge_assets(p, extracted, ids, section)
                     p.setdefault("analysis_checkpoints", []).append(checkpoint)
                 project = store.change(project_id, apply_assets)
             extraction["applied"] = True
@@ -286,6 +391,8 @@ async def analyse(store, job_id):
             if preceding:
                 content["previous_shot"] = {"local_id": "previous_chunk", "scene_id": (preceding.get("scene") or {}).get("asset_id"),
                                             **{key: preceding.get(key, "") for key in ("summary", "story_time", "image_prompt")}}
+            content["recent_dialogues"] = [{k: d.get(k) for k in ("id", "character_id", "type", "text", "source")}
+                                           for d in project.get("dialogues", []) if d["chapter_id"] == chapter["id"] and d.get("analysis_id") == job_id][-8:]
             storyboard = next((r for r in responses if r["chunk"] == index and r["stage"] == "shots"), None)
             if storyboard is None:
                 if store.job(job_id).get("cancel_requested"):
@@ -299,10 +406,11 @@ async def analyse(store, job_id):
                 store.update_job(job_id, responses=responses)
             draft = parse_json(storyboard["raw"])
             normalize_draft_sources(project, draft["shots"])
+            normalize_draft_sources(project, draft.get("dialogues", []))
             checkpoint = f"{job_id}:{index}:shots"
             if checkpoint not in project.get("analysis_checkpoints", []):
                 def apply_shots(p):
-                    merge_shots(p, chapter["id"], draft, ids, job_id)
+                    merge_shots(p, chapter["id"], draft, ids, job_id, section)
                     p.setdefault("analysis_checkpoints", []).append(checkpoint)
                 store.change(project_id, apply_shots)
             storyboard["applied"] = True

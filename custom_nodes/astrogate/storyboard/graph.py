@@ -114,6 +114,12 @@ def plan(store, project, shot_ids, allow_missing=False, force=False, asset_id=No
             return
         visited.add(shot_id)
         shot = shots[shot_id]
+        if shot.get("unresolved_scene_id"):
+            raise ValueError("本镜场景引用待确认，请先在分镜卡选择场景或确认按文字生成。")
+        if shot.get("source_refs_needs_review"):
+            raise ValueError("本镜原文定位待确认，请先在分镜卡选择对应段落。")
+        if shot.get("unresolved_participants"):
+            raise ValueError("本镜出镜人物待确认，请先在分镜卡选择人物或确认按文字生成。")
         snap = snapshot(project, shot)
         fingerprint = semantic_hash(snap)
         reusable = next((j for j in jobs if j.get("owner_id") == shot_id and j.get("fingerprint") == fingerprint

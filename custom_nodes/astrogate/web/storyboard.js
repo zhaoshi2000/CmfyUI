@@ -217,11 +217,11 @@ function panelWidget(node, root, height) {
             e.preventDefault();
             e.stopPropagation();
             app.canvas.canvas.dispatchEvent(new PointerEvent(e.type, e));
-        } else if (e.target.closest("button,input,textarea,select,summary,a")) e.stopPropagation();
+        } else if (e.target.closest("button,input,textarea,select,summary,a,audio")) e.stopPropagation();
     });
     root.addEventListener("auxclick", e => { if (e.button === 1) e.preventDefault(); });
     for (const event of ["keydown", "wheel"]) root.addEventListener(event, e => {
-        if (e.target.closest("button,input,textarea,select,summary,a")) e.stopPropagation();
+        if (e.target.closest("button,input,textarea,select,summary,a,audio")) e.stopPropagation();
     });
     node.agStatus = element("div", "就绪", "ag-native-status");
     return widget;
@@ -288,6 +288,167 @@ function restorePreview(node) {
         }
     }
 }
+const dialogueProjects = new Map();
+const dialogueRevisions = new Map();
+async function loadDialogues(projectId, force = false) {
+    if (!force && dialogueProjects.has(projectId)) return dialogueProjects.get(projectId);
+    const pending = request(`/projects/${projectId}`).then(data => {
+        dialogueRevisions.set(projectId, data.project.dialogue_revision || 0);
+        return data.project;
+    });
+    dialogueProjects.set(projectId, pending);
+    try { return await pending; } catch (error) { dialogueProjects.delete(projectId); throw error; }
+}
+function updateDialogueCards(project) {
+    dialogueProjects.set(project.id, Promise.resolve(project));
+    dialogueRevisions.set(project.id, project.dialogue_revision || 0);
+    for (const node of nodes()) if (node.properties?.astrogate_project === project.id) {
+        node.agRefreshVoice?.(project);
+        node.agRenderScene?.(project);
+        if (node.agDialogueDirty?.size) message(node, "台词已更新；当前未保存内容已保留，请检查后保存。", false, true);
+        else node.agRenderDialogue?.(project);
+    }
+}
+async function editDialogue(node, body, scope) {
+    const project = await request(`/projects/${node.properties.astrogate_project}/edit`, body);
+    node.agDialogueDirty?.delete(scope);
+    updateDialogueCards(project);
+    return project;
+}
+function installDialogue(node, resizeCard) {
+    node.agDialogueDirty = new Set();
+    const detail = element("details", undefined, "ag-dialogue");
+    const summary = element("summary", "台词 · 加载中");
+    const contents = element("div");
+    detail.append(summary, contents);
+    detail.open = node.properties.astrogate_dialogue_open === true;
+    detail.addEventListener("toggle", () => {
+        node.properties.astrogate_dialogue_open = detail.open;
+        summary.textContent = summary.textContent.replace(/点击(展开|收起)$/, detail.open ? "点击收起" : "点击展开");
+        app.graph.change();
+        resizeCard();
+    });
+    const field = (label, input) => { const box = element("label", label); box.append(input); return box; };
+    const select = (items, selected) => {
+        const input = element("select");
+        for (const [value, label] of items) { const option = element("option", label); option.value = value; input.append(option); }
+        input.value = selected ?? "";
+        return input;
+    };
+    const modes = [["start", "开始"], ["continue", "继续"], ["audio_only", "画外音"], ["finish", "结束"]];
+    const types = [["dialogue", "人物台词"], ["narration", "旁白"], ["voiceover", "画外音"], ["inner", "内心独白"]];
+    node.agRenderDialogue = project => {
+        const shot = (project.shots || []).find(item => item.id === node.properties.astrogate_owner);
+        const links = shot?.dialogue_links || [];
+        const dialogues = project.dialogues || [];
+        const characters = (project.assets || []).filter(asset => asset.kind === "character");
+        summary.textContent = `台词 ${links.length} · 点击${detail.open ? "收起" : "展开"}`;
+        if (!shot) { contents.replaceChildren(element("div", "未找到当前镜头。", "ag-hint")); return; }
+        const saveLinks = async (next, scope, expected = links) => {
+            const latest = await loadDialogues(project.id);
+            const current = (latest.shots || []).find(item => item.id === shot.id)?.dialogue_links || [];
+            if (JSON.stringify(current) !== JSON.stringify(expected)) throw new Error("本镜台词关联已变化，请保存其他编辑后刷新检查。");
+            return editDialogue(node, {action: "dialogue_links", shot_id: shot.id, links: next, revision: latest.revision}, scope);
+        };
+        const rows = links.map((link, index) => {
+            const dialogue = dialogues.find(item => item.id === link.dialogue_id);
+            const row = element("div", undefined, "ag-dialogue-row");
+            if (!dialogue) { row.append(element("div", "关联的台词不存在。")); return row; }
+            const text = element("textarea"); text.value = dialogue.text || "";
+            const sharedScope = `shared:${index}`, linkScope = `link:${index}`;
+            const character = select([["", "未指定人物"], ...characters.map(item => [item.id, item.name])], dialogue.character_id || "");
+            const type = select(types, dialogue.type);
+            const emotion = element("input"); emotion.value = dialogue.emotion || ""; emotion.placeholder = "情绪";
+            const tone = element("input"); tone.value = dialogue.tone || ""; tone.placeholder = "语气";
+            for (const input of [text, character, type, emotion, tone]) {
+                input.addEventListener("input", () => { node.agDialogueDirty.add(sharedScope); });
+                input.addEventListener("change", () => { node.agDialogueDirty.add(sharedScope); });
+            }
+            const status = select([["pending", "待确认"], ["confirmed", "已确认"]], dialogue.status || "pending");
+            status.addEventListener("change", () => { node.agDialogueDirty.add(sharedScope); });
+            const save = button(node, "保存共享台词", async () => {
+                await editDialogue(node, {action: "dialogue_save", dialogue: {id: dialogue.id, revision: dialogue.revision, text: text.value, character_id: character.value || null,
+                    type: type.value, emotion: emotion.value, tone: tone.value, status: status.value}}, sharedScope);
+            });
+            const start = element("input"); start.type = "number"; start.min = 0; start.value = link.start ?? ""; start.placeholder = "从头";
+            const end = element("input"); end.type = "number"; end.min = 0; end.value = link.end ?? ""; end.placeholder = "到尾";
+            const mode = select(modes, link.mode);
+            const subtitle = element("input"); subtitle.type = "checkbox"; subtitle.checked = link.show_subtitle !== false;
+            for (const input of [start, end, mode, subtitle]) input.addEventListener("change", () => { node.agDialogueDirty.add(linkScope); });
+            const preview = element("div", "", "ag-dialogue-preview");
+            const previewPart = () => {
+                const chars = Array.from(text.value);
+                const a = start.value === "" ? 0 : Number(start.value), b = end.value === "" ? chars.length : Number(end.value);
+                preview.textContent = `本镜片段（按字符序号，前闭后开）：${chars.slice(a, b).join("") || "（空）"}`;
+            };
+            for (const input of [text, start, end]) input.addEventListener("input", () => { if (input !== text) node.agDialogueDirty.add(linkScope); previewPart(); });
+            previewPart();
+            const saveLink = button(node, "保存本镜片段", async () => {
+                const next = links.map(item => ({...item}));
+                next[index] = {...link, start: start.value === "" ? null : Number(start.value), end: end.value === "" ? null : Number(end.value),
+                    mode: mode.value, show_subtitle: subtitle.checked, needs_review: false, confirm_range: true};
+                await saveLinks(next, linkScope);
+            });
+            const changeOrder = async next => { if (node.agDialogueDirty.size) throw new Error("请先保存本卡片内正在编辑的台词和片段。"); await saveLinks(next); };
+            const up = button(node, "↑", async () => { if (!index) return; const next = links.slice(); [next[index-1], next[index]] = [next[index], next[index-1]]; await changeOrder(next); });
+            const down = button(node, "↓", async () => { if (index === links.length-1) return; const next = links.slice(); [next[index], next[index+1]] = [next[index+1], next[index]]; await changeOrder(next); });
+            const remove = button(node, "移除此镜关联", () => changeOrder(links.filter((_, i) => i !== index)));
+            const locate = button(node, "定位关联镜头", () => {
+                const related = nodes().find(other => other !== node && other.properties?.astrogate_project === project.id &&
+                    (project.shots || []).some(item => item.id === other.properties.astrogate_owner && (item.dialogue_links || []).some(ref => ref.dialogue_id === dialogue.id)));
+                if (related) focusNode(related); else message(node, "当前画布没有其他关联此台词的镜头。");
+            });
+            const controls = element("div", undefined, "ag-native-actions"); controls.append(saveLink, up, down, remove, locate);
+            const source = {original: "原文", adapted: "AI 改编", user: "用户"}[dialogue.source] || "未知";
+            const related = (project.shots || []).filter(item => item.id !== shot.id && (item.dialogue_links || []).some(ref => ref.dialogue_id === dialogue.id));
+            row.append(element("strong", `共享台词 ${index + 1}${link.needs_review ? " · 片段待确认" : ""}`),
+                element("div", `来源：${source}${dialogue.possible_matches?.length ? " · 可能与其他台词重复，请核对" : ""}`, "ag-hint"),
+                element("div", `其他关联镜头 ${related.length}：${related.map(item => item.summary || item.id).join("、") || "无"}`, "ag-hint"),
+                field("人物", character), field("类型", type), field("状态", status), text, field("情绪", emotion), field("语气", tone), save, element("strong", "当前镜头使用的片段"),
+                field("起始字符", start), field("结束字符", end), field("衔接", mode), field("显示字幕", subtitle), preview, controls);
+            return row;
+        });
+        const available = dialogues.filter(item => item.chapter_id === shot.chapter_id && !links.some(link => link.dialogue_id === item.id));
+        const picker = select(available.map(item => [item.id, (item.text || "（空台词）").slice(0, 50)]), available[0]?.id);
+        const add = button(node, "关联已有台词", async () => {
+            if (node.agDialogueDirty.size) throw new Error("请先保存本卡片内正在编辑的台词和片段。");
+            if (!picker.value) throw new Error("本章没有可关联的台词。");
+            await saveLinks([...links, {dialogue_id: picker.value, start: null, end: null, mode: "start", show_subtitle: true, needs_review: false}]);
+        });
+        const newText = element("textarea"); newText.placeholder = "输入新台词";
+        newText.addEventListener("input", () => { node.agDialogueDirty.add("new"); });
+        const create = button(node, "新增并关联台词", async () => {
+            if (!newText.value.trim()) throw new Error("请先输入台词内容。");
+            if ([...node.agDialogueDirty].some(scope => scope !== "new")) throw new Error("请先保存其他正在编辑的台词和片段。");
+            const oldIds = new Set(dialogues.map(item => item.id));
+            const result = await editDialogue(node, {action: "dialogue_save", dialogue: {chapter_id: shot.chapter_id, text: newText.value, source: "user"}}, "new");
+            const created = result.dialogues.find(item => !oldIds.has(item.id));
+            if (!created) throw new Error("台词已保存，请手动关联。");
+            const current = result.shots.find(item => item.id === shot.id).dialogue_links || [];
+            await saveLinks([...current, {dialogue_id: created.id, start: null, end: null, mode: "start", show_subtitle: true, needs_review: false}], undefined, current);
+        });
+        contents.replaceChildren(...rows, picker, add, newText, create);
+    };
+    node.agLoadDialogue = () => {
+        if (node.properties.astrogate_kind !== "shot" || !node.properties.astrogate_project || !node.properties.astrogate_owner) { detail.hidden = true; return; }
+        detail.hidden = false;
+        loadDialogues(node.properties.astrogate_project).then(project => { node.agRenderScene?.(project); if (!node.agDialogueDirty.size) node.agRenderDialogue(project); }).catch(error => {
+            summary.textContent = "台词 · 加载失败"; message(node, error.message, false, true);
+        });
+    };
+    return detail;
+}
+function downloadPreview(node) {
+    const image = node.properties.astrogate_images?.[0];
+    if (!image?.filename) throw new Error("当前节点还没有可下载的图片。");
+    const link = element("a");
+    link.href = api.apiURL("/view?" + new URLSearchParams(image));
+    link.download = image.filename;
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+}
 function hideNativePreviews(node) {
     let changed = false;
     for (const widget of node.widgets || []) {
@@ -306,6 +467,7 @@ function installFold(nodeType) {
     const created = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
         const result = created?.apply(this, arguments);
+        this.addWidget("button", "下载图片", "", () => downloadPreview(this), {serialize: false});
         this.addWidget("button", "提示词展开/收起", "", () => {
             this.properties.astrogate_prompt_folded = !this.properties.astrogate_prompt_folded;
             apply(this);
@@ -496,7 +658,7 @@ async function addSceneAngle(source, view) {
     focusNode(node);
     return node;
 }
-async function buildBoard(board, info, relayout = false) {
+async function buildBoard(board, info, relayout = false, partial = false) {
     if (board.agBuilding) return board.agBuilding;
     board.agBuilding = (async () => {
         const previousAnalysis = board.properties.astrogate_board?.analysis_id;
@@ -512,11 +674,11 @@ async function buildBoard(board, info, relayout = false) {
         board.agWiringChecked = true;
         board.agLayoutChecked = true;
         const frames = [...mapping.values()].filter(n => n.properties.astrogate_kind === "shot");
-        const auto = frames.length && !migrating && board.properties.astrogate_autogenerate !== false && board.properties.astrogate_auto_started !== info.analysis_id;
+        const auto = !partial && frames.length && !migrating && board.properties.astrogate_autogenerate !== false && board.properties.astrogate_auto_started !== info.analysis_id;
         if (auto) board.properties.astrogate_auto_started = info.analysis_id;
-        message(board, `已建立 ${frames.length} 个分镜，每个人物一张设定卡。默认只参考出镜人物，场景与前情使用文字。${auto ? "正在自动生成图片…" : "可生成本章或选中图片。"}`);
+        message(board, partial ? `已建立 ${frames.length} 个分镜，正在继续分析后续正文块。` : `已建立 ${frames.length} 个分镜，每个人物一张设定卡。默认只参考出镜人物，场景与前情使用文字。${auto ? "正在自动生成图片…" : "可生成本章或选中图片。"}`);
         await saveBoard(board);
-        if (frames.length) focusNode([...mapping.values()].find(n => n.properties.astrogate_view === "sheet") || frames[0]);
+        if (frames.length && !partial) focusNode([...mapping.values()].find(n => n.properties.astrogate_view === "sheet") || frames[0]);
         if (auto) await generate([...frames, ...[...mapping.values()].filter(n => n.properties.astrogate_kind === "character")], false, board);
     })();
     try { return await board.agBuilding; }
@@ -591,7 +753,13 @@ async function generate(targets, force = false, reporter = targets[0]) {
         const jobId = value(node, "job_id");
         const previous = jobId ? await request(`/jobs/${jobId}`) : null;
         let issue = null;
-        if (previous && active.has(previous.status)) {
+        if (node.properties.astrogate_unresolved_scene) {
+            issue = {source: node, jobId, reason: "场景引用待确认，请在卡片中选择场景或确认按文字生成。"};
+        } else if (node.properties.astrogate_unresolved_source) {
+            issue = {source: node, jobId, reason: "原文定位待确认，请在卡片中选择对应段落。"};
+        } else if (node.properties.astrogate_unresolved_people) {
+            issue = {source: node, jobId, reason: "出镜人物待确认，请在卡片中选择人物或确认按文字生成。"};
+        } else if (previous && active.has(previous.status)) {
             issue = {source: node, jobId, reason: "已有任务正在进行，请等待结束后再生成。"};
         } else if (previous?.status === "unknown" && !(requested && force && targets.length === 1)) {
             issue = {source: node, jobId, reason: "上次结果未知；请先确认结果，或在此卡片点击“重绘”。"};
@@ -670,9 +838,17 @@ async function generate(targets, force = false, reporter = targets[0]) {
         const count = prepared.filter(j => j.status !== "succeeded").length;
         const batchReporter = targets.includes(reporter) && !ready.includes(reporter) ? ready[0] : reporter;
         message(batchReporter, `本次 ${count} 张新图 · ${Math.max(0, visited.size - count)} 张复用${targets.length > ready.length ? ` · ${targets.length - ready.length} 张等待确认或上游` : ""} · 按 IMAGE 连线执行`, true);
-        const graph = await app.graphToPrompt();
-        submitted = true;
-        await queueNodes(ready, prepared, graph);
+        if (prepared.every(job => job.status === "succeeded" || (job.references || []).every(ref => ref.job_id))) {
+            for (const job of prepared) {
+                if (job.status === "succeeded") continue;
+                submitted = true;
+                await request(`/jobs/${job.id}/start`, {});
+            }
+        } else {
+            const graph = await app.graphToPrompt();
+            submitted = true;
+            await queueNodes(ready, prepared, graph);
+        }
         const batch = [...visited].map(id => value(app.graph.getNodeById(id), "job_id")).filter(Boolean);
         for (const board of new Set([reporter, ...targets.map(n => sourceNode(n, "board"))].filter(n => n?.type === "AstroGateStoryboard"))) board.properties.astrogate_generation_jobs = batch;
         for (const board of nodes().filter(n => n.type === "AstroGateStoryboard" && n.properties.astrogate_board)) await saveBoard(board);
@@ -725,7 +901,7 @@ async function analysisContext(node) {
     const fields = [source.hash, chapterId, value(node, "text_model"), value(node, "style"), value(node, "density"), value(node, "analysis_revision")];
     if (value(node, "include_props")) fields.push(true);
     // Match the persisted Python JSON digest, including Chinese text and spaces.
-    const serialized = "[" + fields.map(v => JSON.stringify(v).replace(/[\u007f-\uffff]/g, c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"))).join(", ") + "]";
+    const serialized = "[" + fields.map(v => JSON.stringify(v)).join(", ") + "]";
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(serialized));
     const key = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
     return {projectId, chapterId, key};
@@ -803,6 +979,13 @@ function installBoard(node) {
         if (!info) throw new Error("请先分析剧本。");
         await generate(nodes().filter(n => n.properties.astrogate_project === info.project_id && n.properties.astrogate_chapter === info.chapter_id &&
             (n.properties.astrogate_kind === "shot" || n.properties.astrogate_kind === "character")), false, node);
+    }), button(node, "复制本章视频提示词", async () => {
+        const info = node.properties.astrogate_board;
+        if (!info) throw new Error("请先分析剧本。");
+        const query = new URLSearchParams({chapter_id: info.chapter_id, analysis_id: info.analysis_id || ""});
+        const result = await request(`/projects/${info.project_id}/video-prompt?${query}`);
+        await navigator.clipboard.writeText(result.prompt);
+        message(node, `已复制视频提示词；图像 ${result.images.length} 张、声线 ${result.audios.length} 条${result.warnings.length ? `，${result.warnings.length} 处台词待确认` : ""}。按清单顺序在即梦网页附加素材。`);
     }), button(node, "停止分析", async () => {
         const context = await analysisContext(node);
         const promptId = node.properties.astrogate_prompt_key === context.key ? node.properties.astrogate_prompt_id : null;
@@ -971,11 +1154,41 @@ function installFrame(node) {
     panelWidget(node, root, cardHeight);
     node.agStatus.hidden = true;
     const controls = element("div", undefined, "ag-native-actions");
-    controls.append(button(node, "生成图像", () => generate([node]), "primary"), button(node, "重绘", () => generate([node], true)),
+    controls.append(button(node, "生成图像", () => generate([node]), "primary"), button(node, "重绘", () => generate([node], true)), button(node, "下载图片", () => downloadPreview(node)),
         button(node, "停止", async () => {
             const id = value(node, "job_id");
             if (id) await request(`/jobs/${id}/cancel`, {});
         }));
+    const voiceFile = element("input");
+    voiceFile.type = "file";
+    voiceFile.accept = ".wav,.mp3,.m4a,.flac,audio/*";
+    voiceFile.hidden = true;
+    const voiceButton = button(node, "绑定角色声线", () => voiceFile.click());
+    const voiceStatus = element("span", "未绑定声线", "ag-hint");
+    const voicePlayer = element("audio");
+    voicePlayer.controls = true;
+    voicePlayer.preload = "none";
+    voicePlayer.hidden = true;
+    voiceFile.addEventListener("change", async () => {
+        const file = voiceFile.files?.[0];
+        if (!file) return;
+        try {
+            const data = new FormData();
+            data.append("voice", file);
+            const project = await request(`/projects/${node.properties.astrogate_project}/assets/${node.properties.astrogate_owner}/voice`, data);
+            updateDialogueCards(project);
+            node.agRefreshVoice?.(project);
+            message(node, "声线已绑定到人物身份，换装仍使用同一声线。");
+        } catch (error) { message(node, error.message, false, true); }
+        finally { voiceFile.value = ""; }
+    });
+    node.agRefreshVoice = project => {
+        const asset = project.assets?.find(item => item.id === node.properties.astrogate_owner);
+        voiceStatus.textContent = asset?.current_voice_id ? "已绑定角色声线" : "未绑定声线";
+        voicePlayer.hidden = !asset?.current_voice_id;
+        if (asset?.current_voice_id) voicePlayer.src = api.apiURL(`${base}/projects/${project.id}/assets/${asset.id}/voice/${asset.current_voice_id}`);
+    };
+    controls.append(voiceButton, voiceStatus, voicePlayer, voiceFile);
     const recover = button(node, "查询并取回", async () => {
         const jobId = value(node, "job_id");
         if (!jobId) throw new Error("没有可查询的图片任务。");
@@ -1021,7 +1234,83 @@ function installFrame(node) {
         content: label, callback: () => addSceneAngle(node, view).catch(error => message(node, error.message, false, true)),
     })), {event}));
     controls.append(addAngle);
-    content.append(referenceToggle, referenceList, stage, controls, progressBar(node), detail, node.agStatus);
+    const dialogue = installDialogue(node, resizeCard);
+    const sceneNotice = element("div", undefined, "ag-scene-review");
+    sceneNotice.hidden = true;
+    const sceneLabel = element("div", "场景引用待确认：请选择已有场景，或确认仅按本镜文字生成。此镜确认前不会自动生成。", "ag-native-status error");
+    const scenePicker = element("select");
+    const confirmScene = button(node, "确认本镜场景", async () => {
+        const project = await loadDialogues(node.properties.astrogate_project, true);
+        const updated = await request(`/projects/${project.id}/edit`, {action: "resolve_scene", shot_id: node.properties.astrogate_owner,
+            scene_id: scenePicker.value || null, revision: project.revision});
+        updateDialogueCards(updated);
+        app.graph.change();
+        message(node, "本镜场景已确认；可点击生成图像。");
+    });
+    sceneNotice.append(sceneLabel, scenePicker, confirmScene);
+    const sourceNotice = element("div", undefined, "ag-scene-review");
+    sourceNotice.hidden = true;
+    const sourcePicker = element("select");
+    const confirmSource = button(node, "确认本镜原文段落", async () => {
+        const project = await loadDialogues(node.properties.astrogate_project, true);
+        if (!sourcePicker.value) throw new Error("请选择对应原文段落。");
+        const updated = await request(`/projects/${project.id}/edit`, {action: "resolve_sources", shot_id: node.properties.astrogate_owner,
+            paragraph_id: sourcePicker.value, revision: project.revision});
+        updateDialogueCards(updated);
+        app.graph.change();
+        message(node, "本镜原文段落已确认。");
+    });
+    sourceNotice.append(element("div", "本镜部分原文定位无法核实，请选对应段落；确认前不会自动生成。", "ag-native-status error"), sourcePicker, confirmSource);
+    const peopleNotice = element("div", undefined, "ag-scene-review");
+    peopleNotice.hidden = true;
+    const peopleLabel = element("div", "", "ag-native-status error");
+    const peoplePicker = element("select");
+    const confirmPerson = button(node, "确认出镜人物", async () => {
+        if (!peoplePicker.value) throw new Error("请选择人物，或明确选择仅按文字生成。");
+        const project = await loadDialogues(node.properties.astrogate_project, true);
+        const updated = await request(`/projects/${project.id}/edit`, {action: "resolve_participant", shot_id: node.properties.astrogate_owner,
+            character_id: peoplePicker.value === "text_only" ? null : peoplePicker.value, revision: project.revision});
+        updateDialogueCards(updated);
+        app.graph.change();
+        message(node, "出镜人物已确认。");
+    });
+    peopleNotice.append(peopleLabel, peoplePicker, confirmPerson);
+    node.agRenderScene = project => {
+        const shot = project.shots?.find(item => item.id === node.properties.astrogate_owner);
+        const unresolved = node.properties.astrogate_kind === "shot" && Boolean(shot?.unresolved_scene_id);
+        const unresolvedSource = node.properties.astrogate_kind === "shot" && Boolean(shot?.source_refs_needs_review);
+        const unresolvedPeople = node.properties.astrogate_kind === "shot" && Boolean(shot?.unresolved_participants?.length);
+        node.properties.astrogate_unresolved_scene = unresolved;
+        node.properties.astrogate_unresolved_source = unresolvedSource;
+        node.properties.astrogate_unresolved_people = unresolvedPeople;
+        sceneNotice.hidden = !unresolved;
+        sourceNotice.hidden = !unresolvedSource;
+        peopleNotice.hidden = !unresolvedPeople;
+        if (unresolved) {
+            const current = scenePicker.value;
+            const choices = [["", "按本镜文字生成（不绑定场景素材）"], ...(project.assets || []).filter(item => ["scene", "scene_state"].includes(item.kind) && !item.redirect_to).map(item => [item.id, item.name])];
+            scenePicker.replaceChildren(...choices.map(([id, label]) => { const option = element("option", label); option.value = id; return option; }));
+            scenePicker.value = choices.some(([id]) => id === current) ? current : "";
+        }
+        if (unresolvedSource) {
+            const current = sourcePicker.value;
+            const chapter = project.chapters?.find(item => item.id === shot.chapter_id);
+            const choices = [["", "选择本章原文段落"], ...(chapter?.paragraphs || []).map((item, index) => [item.id, `${index + 1}. ${item.text.slice(0, 80)}`])];
+            sourcePicker.replaceChildren(...choices.map(([id, label]) => { const option = element("option", label); option.value = id; return option; }));
+            sourcePicker.value = choices.some(([id]) => id === current) ? current : "";
+        }
+        if (unresolvedPeople) {
+            const person = shot.unresolved_participants[0];
+            peopleLabel.textContent = `出镜人物待确认：AI 引用 ${person.character_id || "空 ID"}，动作：${person.action || "未描述"}。确认前此镜不会自动生成。`;
+            const current = peoplePicker.value;
+            const choices = [["", "选择已有角色"], ...(project.assets || []).filter(item => item.kind === "character" && !item.redirect_to).map(item => [item.id, item.name]),
+                ["text_only", "仅按文字生成（不连人物参考）"]];
+            peoplePicker.replaceChildren(...choices.map(([id, label]) => { const option = element("option", label); option.value = id; return option; }));
+            peoplePicker.value = choices.some(([id]) => id === current) ? current : "";
+        }
+        resizeCard();
+    };
+    content.append(referenceToggle, referenceList, stage, controls, progressBar(node), detail, sceneNotice, sourceNotice, peopleNotice, node.agStatus, dialogue);
     node.agRefresh = () => {
         const kind = node.properties.astrogate_kind;
         if (kindColors[kind]) {
@@ -1045,10 +1334,16 @@ function installFrame(node) {
         ratio.disabled = node.properties.astrogate_kind === "shot" && Boolean(sourceNode(node, "board"));
         ratio.title = ratio.disabled ? "在所连的 AI 分镜脚本节点统一设置画幅" : "素材独立画幅，设定卡与场景母图默认16:9";
         approve.hidden = node.properties.astrogate_owner_type !== "asset" || node.properties.astrogate_view?.startsWith("scene_");
+        voiceButton.hidden = voiceStatus.hidden = node.properties.astrogate_kind !== "character";
+        if (voiceButton.hidden) voicePlayer.hidden = true;
+        if (!voiceButton.hidden && node.properties.astrogate_project) {
+            loadDialogues(node.properties.astrogate_project).then(node.agRefreshVoice).catch(() => {});
+        }
         addAngle.hidden = !scene || node.properties.astrogate_view?.startsWith("scene_");
         node.agRefreshReferences();
         upgradeSignature(node);
         restorePreview(node);
+        node.agLoadDialogue();
     };
     node.size = [430, 400];
     node.agRefresh();
@@ -1062,6 +1357,9 @@ async function poll() {
     for (const project of projects) {
         try {
             const result = await request(`/projects/${project}?summary=1`);
+            if (dialogueRevisions.has(project) && dialogueRevisions.get(project) !== (result.dialogue_revision || 0)) {
+                updateDialogueCards(await loadDialogues(project, true));
+            }
             const jobs = new Map(result.jobs.map(j => [j.id, j]));
             for (const node of frames.filter(n => n.properties.astrogate_project === project)) {
                 const job = jobs.get(value(node, "job_id"));
@@ -1094,9 +1392,16 @@ async function poll() {
                 batchProgress(node, jobs);
                 const busy = submitting || result.jobs.some(j => j.kind === "image" &&
                     (["running", "queued", "cancelling"].includes(j.status) || (j.status === "prepared" && j.prompt_id)));
-                if (job?.status === "succeeded" && !busy && (node.properties.astrogate_board?.analysis_id !== job.id || (!node.agLayoutChecked && node.properties.astrogate_layout_version !== 4) || !node.agWiringChecked)) {
+                const partial = node.properties.astrogate_partial_progress;
+                if (job && job.status !== "succeeded" && job.completed_chunks > 0 && !busy &&
+                    (partial?.job_id !== job.id || partial.chunks < job.completed_chunks)) {
+                    await buildBoard(node, {project_id: project, chapter_id: job.chapter_id, analysis_id: job.id}, false, true);
+                    node.properties.astrogate_partial_progress = {job_id: job.id, chunks: job.completed_chunks};
+                }
+                if (job?.status === "succeeded" && !busy && (node.properties.astrogate_board?.analysis_id !== job.id || partial?.job_id === job.id || (!node.agLayoutChecked && node.properties.astrogate_layout_version !== 4) || !node.agWiringChecked)) {
                     delete node.properties.astrogate_resume_job;
                     await buildBoard(node, {project_id: project, chapter_id: job.chapter_id, analysis_id: job.id});
+                    delete node.properties.astrogate_partial_progress;
                 }
             }
         } catch (error) {

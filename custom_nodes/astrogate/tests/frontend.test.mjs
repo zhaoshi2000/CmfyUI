@@ -7,7 +7,7 @@ import { webcrypto } from "node:crypto";
 const source = await readFile(new URL("../web/storyboard.js", import.meta.url), "utf8");
 async function load(app, extras = {}, api = {}) {
     const context = vm.createContext({queueMicrotask, structuredClone, console, JSON, Set, Map, URLSearchParams, TextEncoder, crypto: webcrypto, ...extras});
-    const module = new vm.SourceTextModule(source + "\nexport { installFold, mountGraph, changed, generate, installFrame, analysisContext, startAnalysis, showAnalysisState, poll, panelWidget, activityStatus, activityLines, message, createActivityPanel, buildBoard, applyFrameAspect, batchProgress, addSceneAngle, nodeSignature, upgradeSignature };", {context});
+    const module = new vm.SourceTextModule(source + "\nexport { installFold, mountGraph, changed, generate, installFrame, installDialogue, analysisContext, startAnalysis, showAnalysisState, poll, panelWidget, activityStatus, activityLines, message, createActivityPanel, buildBoard, applyFrameAspect, batchProgress, addSceneAngle, nodeSignature, upgradeSignature };", {context});
     await module.link(async specifier => {
         const name = specifier.includes("app.js") ? "app" : "api";
         return new vm.SyntheticModule([name], function () { this.setExport(name, name === "app" ? app : api); }, {context});
@@ -54,6 +54,74 @@ test("legacy folding preserves values, references and output previews", async ()
     await new Promise(resolve => queueMicrotask(resolve));
     assert.equal(app.nodeOutputs[12].images[0].filename, "frame.png");
     node.widgets.at(-1).callback(); assert.equal(node.widgets[0].hidden, false);
+});
+test("unconfirmed scene skips its image without submitting a request", async () => {
+    const {graph, LiteGraph} = graphMock(); graph.change = () => {};
+    const node = LiteGraph.createNode("AstroGateStoryboardFrame"); graph.add(node);
+    node.title = "待确认场景";
+    node.properties = {astrogate_project: "p", astrogate_kind: "shot", astrogate_unresolved_scene: true};
+    const calls = [];
+    const app = {registerExtension() {}, graph, nodeOutputs: {}};
+    const {generate} = await load(app, {FormData: class {}}, {fetchApi: async (...args) => { calls.push(args); throw new Error("unexpected request"); }});
+    await generate([node]);
+    assert.match(node.properties.astrogate_status, /场景引用待确认/);
+    assert.equal(calls.length, 0);
+});
+test("unconfirmed person skips its image without submitting a request", async () => {
+    const {graph, LiteGraph} = graphMock(); graph.change = () => {};
+    const node = LiteGraph.createNode("AstroGateStoryboardFrame"); graph.add(node);
+    node.title = "待确认人物";
+    node.properties = {astrogate_project: "p", astrogate_kind: "shot", astrogate_unresolved_people: true};
+    const calls = [];
+    const app = {registerExtension() {}, graph, nodeOutputs: {}};
+    const {generate} = await load(app, {FormData: class {}}, {fetchApi: async (...args) => { calls.push(args); throw new Error("unexpected request"); }});
+    await generate([node]);
+    assert.match(node.properties.astrogate_status, /出镜人物待确认/);
+    assert.equal(calls.length, 0);
+});
+test("dialogue cards preserve shared edits and preview Unicode character ranges", async () => {
+    const elements = [];
+    class Element {
+        constructor(tag) { this.tag = tag; this.children = []; this.events = {}; this.classList = {toggle() {}}; elements.push(this); }
+        append(...items) { this.children.push(...items); }
+        replaceChildren(...items) { this.children = items; }
+        addEventListener(name, fn) { (this.events[name] ||= []).push(fn); }
+        fire(name) { for (const fn of this.events[name] || []) fn({}); }
+    }
+    const {graph, LiteGraph} = graphMock(); graph.change = () => {};
+    const first = LiteGraph.createNode("AstroGateStoryboardFrame"), second = LiteGraph.createNode("AstroGateStoryboardFrame");
+    graph.add(first); graph.add(second);
+    for (const node of [first, second]) {
+        node.properties = {astrogate_project: "project", astrogate_owner: node === first ? "s1" : "s2", astrogate_kind: "shot"};
+        node.agStatus = new Element("div");
+    }
+    let project = {id:"project", revision:1, dialogue_revision:1, assets:[], dialogues:[{id:"d", chapter_id:"c", text:"你😀好", type:"dialogue", source:"original", status:"pending", revision:1}],
+        shots:[{id:"s1", chapter_id:"c", dialogue_links:[{dialogue_id:"d", start:1, end:2, mode:"start", show_subtitle:true}]},
+            {id:"s2", chapter_id:"c", dialogue_links:[{dialogue_id:"d", start:2, end:3, mode:"finish", show_subtitle:true}]}]};
+    const calls = [];
+    const api = {fetchApi: async (path, options) => {
+        const body = options.body && JSON.parse(options.body); calls.push(body);
+        if (!body) return {ok:true, json:async()=>({project})};
+        project = {...project, revision:project.revision + 1, dialogue_revision:project.dialogue_revision + 1,
+            dialogues:project.dialogues.map(item => item.id === body.dialogue?.id ? {...item, ...body.dialogue, revision:item.revision + 1} : item)};
+        return {ok:true, json:async()=>project};
+    }};
+    const {installDialogue} = await load({registerExtension(){}, graph}, {FormData:class {}, document:{createElement:tag=>new Element(tag)}}, api);
+    const card1 = installDialogue(first, () => {}), card2 = installDialogue(second, () => {});
+    first.agLoadDialogue(); second.agLoadDialogue();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.match(card1.children[0].textContent, /台词 1/);
+    assert.equal(card1.open, false);
+    const row1 = card1.children[1].children[0], row2 = card2.children[1].children[0];
+    assert.match(row1.children.find(el=>el.className === "ag-dialogue-preview").textContent, /😀/);
+    const text1 = row1.children.find(el=>el.tag === "textarea"), text2 = row2.children.find(el=>el.tag === "textarea");
+    text2.value = "未保存的另一镜编辑"; text2.fire("input");
+    text1.value = "你好"; text1.fire("input");
+    row1.children.find(el=>el.textContent === "保存共享台词").fire("click");
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(calls.at(-1).dialogue.revision, 1);
+    assert.equal(text2.value, "未保存的另一镜编辑");
+    assert.equal(card2.children[1].children[0], row2);
 });
 test("native board creates real image/story wires, shares assets and preserves manual edits on restore", async () => {
     const {graph, LiteGraph} = graphMock();
@@ -148,8 +216,7 @@ test("story edges never prepare or regenerate the preceding image", async () => 
     const prepared = JSON.parse(calls.find(([p]) => p.endsWith("/native/prepare"))[1]);
     assert.equal(prepared.story_parent_id, "previous");
     assert.deepEqual(prepared.references, []);
-    const queued = JSON.parse(calls.find(([p]) => p === "/prompt")[1]);
-    assert.deepEqual(queued.partial_execution_targets, [String(target.id)]);
+    assert.equal(calls.filter(([p]) => p.endsWith("/jobs/new/start")).length, 1);
 });
 
 test("regenerating a later frame reuses saved predecessors even when their controls were edited", async () => {
@@ -240,7 +307,7 @@ test('batch skips unknown and running branches but still queues independent targ
     assert.match(blocked.agStatus.textContent,/未知人物.*结果未知.*重绘/);
     assert.match(busy.agStatus.textContent,/生成中的场景.*任务正在进行/);
     assert.deepEqual(calls.filter(([path])=>path.endsWith('/native/prepare')).map(([,body])=>body.owner_id),['独立镜头']);
-    assert.deepEqual(calls.find(([path])=>path==='/prompt')[1].partial_execution_targets,[String(independent.id)]);
+    assert.equal(calls.filter(([path])=>path.endsWith('/jobs/independent-job/start')).length,1);
     assert.equal(unknown.widgets[1].value,'unknown-job');
     assert.equal(running.widgets[1].value,'running-job');
 });
@@ -272,7 +339,7 @@ test('all blocked targets do not submit work and only explicit single redraw ret
     await generate([source],true);
     const body=calls.find(([path])=>path.endsWith('/native/prepare'))[1];
     assert.equal(body.owner_id,'actor');assert.equal(body.force,true);
-    assert.equal(calls.filter(([path])=>path==='/prompt').length,1);
+    assert.equal(calls.filter(([path])=>path.endsWith('/jobs/redrawn/start')).length,1);
 });
 
 test('a skipped branch keeps its reason while the source is unresolved and clears it when resolved',async()=>{
@@ -373,7 +440,7 @@ function analysisGraph() {
     graph.serialize=()=>({});
     return {graph,LiteGraph,board};
 }
-const expectedAnalysisKey='78060fd40dc38dda3541669d10b4300be7c7b25787fb93ed76ef8e570975ac96';
+const expectedAnalysisKey='25d11e2341c4c999ced946d4f9341486401e3c48b8049de8eebfeba8aa870026';
 const failedAnalysis={id:'failed-job',kind:'text',status:'failed',error:'文本接口 HTTP 503，未自动重试或切换模型。',analysis_key:expectedAnalysisKey,chapter_id:'chapter-id'};
 function analysisAPI(calls, jobs) {
     return {fetchApi:async(path,options)=>{
@@ -546,17 +613,47 @@ test('building a chapter queues images once and the saved auto marker survives r
     const info={project_id:'project',chapter_id:'chapter-id',analysis_id:'analysis'};
     await Promise.all([buildBoard(board,info),buildBoard(board,info)]);
     assert.equal(calls.filter(([p])=>p.endsWith('/native/canvas')).length,1);
-    assert.equal(calls.filter(([p])=>p==='/prompt').length,1);
+    assert.equal(calls.filter(([p])=>p.endsWith('/start')).length,2);
     const prepared=calls.filter(([p])=>p.endsWith('/native/prepare')).map(([,b])=>b);
     assert.deepEqual(prepared.map(b=>b.prompt),['sheet','shot']);
     assert.equal(prepared.find(b=>b.prompt==='shot').references[0].job_id,'job-sheet');
     assert.equal(prepared.find(b=>b.prompt==='sheet').view,'sheet');
     assert.equal(board.properties.astrogate_generation_jobs.length,2);
     await buildBoard(board,info,true);
-    assert.equal(calls.filter(([p])=>p==='/prompt').length,1);
+    assert.equal(calls.filter(([p])=>p.endsWith('/start')).length,2);
     board.properties.astrogate_autogenerate=false;
     await buildBoard(board,{...info,analysis_id:'another'});
-    assert.equal(calls.filter(([p])=>p==='/prompt').length,1);
+    assert.equal(calls.filter(([p])=>p.endsWith('/start')).length,2);
+});
+
+test('completed chunks add cards without submitting images until analysis finishes',async()=>{
+    const {graph,LiteGraph,board}=analysisGraph();
+    const info={project_id:'project',chapter_id:'chapter-id',analysis_id:'analysis'};
+    const item=id=>({id,type:'AstroGateStoryboardFrame',title:id,pos:[500,100],
+        widgets:{prompt:id,job_id:'',aspect_ratio:'16:9',resolution:'1K',quality:'high'},
+        properties:{astrogate_project:'project',astrogate_owner:id,astrogate_owner_type:'shot',astrogate_key:id,astrogate_kind:'shot',astrogate_base_prompt:id}});
+    let ids=['shot1'];
+    const calls=[];
+    const api={fetchApi:async(path,options)=>{
+        const body=options?.body?JSON.parse(options.body):null; calls.push([path,body]);
+        const data=path.endsWith('/native/canvas')?{...info,layout_version:4,reference_wiring_version:4,nodes:ids.map(item),
+            links:ids.map(to=>({from:'$board',slot:0,to,input:'board',type:'ASTROGATE_BOARD'}))}:
+            path.endsWith('/native/prepare')?{id:'job-'+body.prompt,status:'prepared'}:{};
+        return {ok:true,json:async()=>data};
+    }};
+    const app={registerExtension(){},graph,nodeOutputs:{},canvas:{ds:{},centerOnNode(){},selectNode(){}},graphToPrompt:async()=>({output:{},workflow:{}})};
+    const {buildBoard}=await load(app,{LiteGraph,FormData:class{},crypto:{randomUUID:()=> 'partial-images'}},api);
+    await buildBoard(board,info,false,true);
+    assert.equal(graph._nodes.filter(n=>n.properties.astrogate_kind==='shot').length,1);
+    assert.equal(calls.filter(([path])=>path==='/prompt').length,0);
+    ids=['shot1','shot2'];
+    await buildBoard(board,info,false,true);
+    assert.equal(graph._nodes.filter(n=>n.properties.astrogate_kind==='shot').length,2);
+    assert.equal(calls.filter(([path])=>path==='/prompt').length,0);
+    await buildBoard(board,info);
+    assert.equal(calls.filter(([path])=>path.endsWith('/start')).length,2);
+    await buildBoard(board,info);
+    assert.equal(calls.filter(([path])=>path.endsWith('/start')).length,2);
 });
 
 test('migrating an existing chapter simplifies wiring without starting a new image batch',async()=>{
@@ -735,6 +832,10 @@ test('image card controls precede a folded prompt and batch progress counts only
     assert.equal(node.widgets[0].value.split('物品设定素材：').length,2);
     assert.equal(elements.find(e=>e.tag==='textarea').value,node.widgets[0].value);
     assert.equal(node.properties.astrogate_images[0].filename,'old.png');
+    const voiceButton=elements.find(e=>e.textContent==='绑定角色声线');
+    assert.equal(voiceButton.hidden,true);
+    node.properties.astrogate_kind='character';node.agRefresh();
+    assert.equal(voiceButton.hidden,false);
     node.onRemoved();assert.equal(disconnected,true);
 });
 

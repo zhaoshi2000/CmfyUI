@@ -21,10 +21,12 @@ from comfy_api.latest import ComfyExtension, io, ui
 from comfy_execution.graph_utils import ExecutionBlocker
 from server import PromptServer
 
+from .jimeng import AstroGateJimengImageToVideo, register_jimeng_routes
 from .storyboard.graph import render_prompt, semantic_hash, snapshot
 from .storyboard.native import analyse_native
 from .storyboard.service import get_store, register_routes
 from .storyboard.store import aspect_ratio as normalize_aspect_ratio, image_hash, invalidate
+from .storyboard.video import video_prompt
 
 
 API_BASE = os.environ.get("ASTROGATE_IMG_API_BASE", "https://img.astrogate.sbs/internal/astrogate/v1").rstrip("/")
@@ -281,6 +283,65 @@ def save_storyboard_image(store, job, saved, expected_status=None):
                     if previous.get("latest_job_id") != ref["job_id"] or previous.get("stale"):
                         shot["stale"] = True
     store.change(job["project_id"], completed)
+
+
+async def generate_prepared_frame(job_id):
+    store = get_store()
+    job = store.job(job_id)
+    if job["status"] != "queued" or not job.get("native"):
+        raise ValueError("图片任务未排队。")
+    try:
+        while True:
+            sources = [store.job(ref["job_id"]) for ref in job["references"]]
+            if any(source["status"] in ("failed", "unknown", "cancelled", "blocked") for source in sources):
+                store.update_job(job_id, expected_status=("queued",), status="blocked", error="参考图未成功，已跳过本镜。")
+                return
+            if all(source["status"] == "succeeded" for source in sources):
+                break
+            await asyncio.sleep(1)
+        ordered = sorted(job["references"], key=lambda ref: int(ref["slot"].rsplit("_", 1)[1]))
+        references = []
+        for index, ref in enumerate(ordered):
+            source = store.job(ref["job_id"])
+            with Image.open(store.image_path(source["result_image"]["file"])) as opened:
+                data, encoding = encode_reference(opened.convert("RGB"))
+            references.append({"b64_json": base64.b64encode(data).decode(), "filename": f"reference-{index + 1}.{encoding}", "mime_type": f"image/{encoding}"})
+            ref["image"] = source["result_image"]
+        if references:
+            references, ordered = pack_character_views(references, ordered)
+        if len(references) > 8:
+            raise ValueError("本镜超过接口的8张参考图限制，请只连接必要的出镜人物。")
+        settings = job["settings"]
+        width, height = output_dimensions(settings["aspect_ratio"], settings["resolution"])
+        payload = {"model": "gpt-image-2", "prompt": render_prompt(job["snapshot"], ordered),
+                   "size": f"{width}x{height}", "quality": settings["quality"], "n": 1,
+                   "stream": False, "response_format": "b64_json", "gateway_request_id": job["gateway_request_id"]}
+        if references:
+            payload["images"] = references
+        read_api_key()
+        image_timeout()
+        request_path = store.root / "requests" / f"{job_id}.json"
+        request_path.parent.mkdir(exist_ok=True)
+        serialized = json.dumps(payload, ensure_ascii=False).encode()
+        request_path.write_bytes(serialized)
+        store.update_job(job_id, expected_status=("queued",), status="running", references=ordered,
+                         prompt=payload["prompt"], request_hash=hashlib.sha256(serialized).hexdigest())
+        async with frame_queue.slot():
+            try:
+                response = await generate_image(payload, bool(references))
+                image = decode_image(response, (width, height) if settings["resolution"] != "original" else None)
+                saved = ui.ImageSaveHelper.save_images(image, f"AstroGate/{job['project_id']}/{job_id}", io.FolderType.output, None)[0]
+                save_storyboard_image(store, {**job, "references": ordered}, saved)
+            except (RuntimeError, ValueError, OSError, asyncio.CancelledError) as error:
+                if store.job(job_id)["status"] != "succeeded":
+                    store.update_job(job_id, status="unknown", error=f"请求已发出，结果未确认：{str(error) or '本地任务已停止'}；未自动重试。")
+                raise
+    except asyncio.CancelledError:
+        if store.job(job_id)["status"] == "queued":
+            store.update_job(job_id, status="cancelled")
+    except (RuntimeError, ValueError, OSError) as error:
+        if store.job(job_id)["status"] == "queued":
+            store.update_job(job_id, status="failed", error=str(error))
 
 
 async def recover_storyboard_image(store, job):
@@ -571,7 +632,7 @@ class AstroGateStoryboard(io.ComfyNode):
         return io.Schema(node_id="AstroGateStoryboard", display_name="AI 分镜脚本 · 自动建图", category="text/AstroGate",
                          is_output_node=True, not_idempotent=True,
                          inputs=[io.Custom("ASTROGATE_SCRIPT").Input("script", display_name="TXT 剧本"),
-                                 io.Combo.Input("text_model", display_name="文本模型", options=["gpt-5.6-terra", "gpt-6-luna"], default="gpt-5.6-terra"),
+                                 io.Combo.Input("text_model", display_name="文本模型", options=["gpt-6-luna", "gpt-5.6-terra"], default="gpt-6-luna"),
                                  io.Int.Input("chapter", display_name="章节序号", default=1, min=1),
                                  io.String.Input("style", display_name="画风设定", default="写实电影，自然摄影质感，所有人物和场景使用同一画风", multiline=True),
                                  io.String.Input("density", display_name="拆镜要求", default="精细拆镜，保留关键动作、对话反应、空间关系和必要空镜，每镜一张独立关键帧", multiline=True),
@@ -599,11 +660,30 @@ class AstroGateStoryboard(io.ComfyNode):
         return io.NodeOutput(board, json.dumps(shots, ensure_ascii=False, indent=2), ui={"astrogate_board": [board], "astrogate_summary": [f"已完成 {len(shots)} 个镜头"]})
 
 
+class AstroGateVideoPrompt(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(node_id="AstroGateVideoPrompt", display_name="AI 分镜视频提示词与素材清单", category="video/AstroGate",
+                         description="将本章分镜、人物绘本、场景、角色声线和台词片段整理为视频提示词。图片和音频标记是需在即梦网页逐项附加的素材清单。",
+                         is_output_node=True, not_idempotent=True,
+                         inputs=[io.Custom("ASTROGATE_BOARD").Input("board", display_name="分镜脚本")],
+                         outputs=[io.String.Output(display_name="视频提示词"), io.String.Output(display_name="素材清单 JSON")])
+
+    @classmethod
+    def execute(cls, board):
+        store = get_store()
+        project = store.get(board["project_id"])
+        result = video_prompt(project, board["chapter_id"], board.get("analysis_id"), store.jobs(project["id"]))
+        manifest = {key: result[key] for key in ("images", "audios", "warnings", "shot_ids")}
+        return io.NodeOutput(result["prompt"], json.dumps(manifest, ensure_ascii=False, indent=2), ui={"text": [result["prompt"]]})
+
+
 class AstroGateExtension(ComfyExtension):
     async def get_node_list(self):
-        return [AstroGateImage, AstroGateStoryboardFrame, AstroGateTXT, AstroGateStoryboard]
+        return [AstroGateImage, AstroGateStoryboardFrame, AstroGateTXT, AstroGateStoryboard, AstroGateVideoPrompt, AstroGateJimengImageToVideo]
 
 
 async def comfy_entrypoint():
-    register_routes(recover_storyboard_image)
+    register_routes(recover_storyboard_image, generate_prepared_frame)
+    register_jimeng_routes()
     return AstroGateExtension()

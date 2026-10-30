@@ -23,7 +23,7 @@ async def analyse_native(store, project_id, chapter_number, model, style, densit
             p["settings"].update(text_model=model, style=style, density=density)
         store.change(project_id, settings)
         job = store.add_job(project_id, {"kind": "text", "chapter_id": chapter["id"], "model": model,
-                                        "style": style, "density": density, "analysis_key": key, "include_props": include_props})
+                                        "style": style, "density": density, "analysis_key": key, "include_props": include_props, "chunk_limit": 700, "sentence_chunks": True})
         await analyse(store, job["id"])
         job = store.job(job["id"])
     if job["status"] != "succeeded":
@@ -124,6 +124,9 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
                  "astrogate_images": [job["saved_result"]] if job and job.get("saved_result") else []}
         if kind == "shot":
             props["astrogate_atmosphere"] = owner.get("atmosphere", "")
+            props["astrogate_unresolved_scene"] = bool(owner.get("unresolved_scene_id"))
+            props["astrogate_unresolved_source"] = bool(owner.get("source_refs_needs_review"))
+            props["astrogate_unresolved_people"] = bool(owner.get("unresolved_participants"))
         parent = asset_by_id(project, owner.get("parent_id"))
         purpose = {"character": "仅锁定这个人物的身份、脸型与体貌；服装发型配饰以本镜文字设定为准，不自动套用设定卡的基准造型", "look": "此人物的身份、服装、发型和配饰",
                    "scene": "场景空间布局，不自动带入参考图中的人物", "scene_state": "场景时段、天气与光线",
@@ -222,6 +225,12 @@ def prepare_native(store, project, body):
         shot = next((s for s in project["shots"] if s["id"] == owner_id), None)
         if shot is None:
             raise ValueError("分镜已不存在。")
+        if shot.get("unresolved_scene_id"):
+            raise ValueError("本镜场景引用待确认，请先在分镜卡选择场景或确认按文字生成。")
+        if shot.get("source_refs_needs_review"):
+            raise ValueError("本镜原文定位待确认，请先在分镜卡选择对应段落。")
+        if shot.get("unresolved_participants"):
+            raise ValueError("本镜出镜人物待确认，请先在分镜卡选择人物或确认按文字生成。")
         shot = copy.deepcopy(shot)
     elif kind == "asset":
         asset = asset_by_id(project, owner_id)

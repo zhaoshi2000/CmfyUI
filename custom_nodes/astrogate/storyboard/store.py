@@ -65,22 +65,48 @@ def parse_novel(data, title):
         raise ValueError("TXT 中没有可分析的正文。")
     return {"id": new_id(), "title": title, "schema_version": 1, "revision": 0,
             "source": {"id": source_id, "text": text, "encoding": encoding, "hash": hashlib.sha256(data).hexdigest()},
-            "chapters": chapters, "assets": [], "shots": [], "workflows": {},
-            "settings": {"text_model": "gpt-5.6-terra", "style": "写实电影分镜，自然摄影质感；所有人物和场景使用同一画风", "density": "精细拆镜，保留关键动作、对话反应、空间关系和必要空镜，每镜一张独立关键帧",
+            "chapters": chapters, "assets": [], "shots": [], "dialogues": [], "dialogue_revision": 0, "workflows": {},
+            "settings": {"text_model": "gpt-6-luna", "style": "写实电影分镜，自然摄影质感；所有人物和场景使用同一画风", "density": "精细拆镜，保留关键动作、对话反应、空间关系和必要空镜，每镜一张独立关键帧",
                          "aspect_ratio": "16:9", "resolution": "4K", "quality": "high", "include_props": False}}
 
 
-def chunks(paragraphs, limit=6000):
+def chunks(paragraphs, limit=6000, prefer_sentences=False):
     batch, size = [], 0
     for paragraph in paragraphs:
-        # Split oversized paragraphs without inventing new source paragraph IDs.
-        for offset in range(0, len(paragraph["text"]), limit):
-            piece = {**paragraph, "text": paragraph["text"][offset:offset + limit], "slice_start": offset}
+        text = paragraph["text"]
+        boundaries, spans, stack = [], [], []
+        if prefer_sentences:
+            pairs = {"“": "”", "‘": "’", "「": "」", "『": "』", '"': '"'}
+            for index, char in enumerate(text):
+                if stack and char == stack[-1][1]:
+                    start, _ = stack.pop()
+                    if not stack:
+                        spans.append((start, index + 1))
+                        if index and text[index - 1] in "。！？!?":
+                            boundaries.append(index + 1)
+                elif char in pairs:
+                    stack.append((index, pairs[char]))
+                elif not stack and char in "。！？!?":
+                    boundaries.append(index + 1)
+            if stack:
+                spans.append((stack[0][0], len(text)))
+        offset = 0
+        while offset < len(text):
+            end = min(offset + limit, len(text))
+            if prefer_sentences and end < len(text):
+                candidates = [point for point in boundaries if offset + limit // 2 <= point <= end]
+                if candidates:
+                    end = candidates[-1]
+                crossing = next(((start, stop) for start, stop in spans if start < end < stop), None)
+                if crossing:
+                    end = crossing[0] if crossing[0] > offset else crossing[1]
+            piece = {**paragraph, "text": text[offset:end], "slice_start": offset}
             if batch and size + len(piece["text"]) > limit:
                 yield batch
                 batch, size = [], 0
             batch.append(piece)
             size += len(piece["text"])
+            offset = end
     if batch:
         yield batch
 
@@ -118,6 +144,84 @@ def check_sources(project, refs, allowed=None):
             raise ValueError("分析结果的引文与原文不符，请编辑草稿。")
 
 
+def save_dialogue(project, values):
+    if not isinstance(values, dict):
+        raise ValueError("台词内容无效。")
+    dialogues = project.setdefault("dialogues", [])
+    dialogue_id = values.get("id")
+    existing = next((item for item in dialogues if item["id"] == dialogue_id), None)
+    if dialogue_id and existing is None:
+        raise ValueError("台词不存在，请刷新项目。")
+    if existing and "revision" in values and values["revision"] != existing["revision"]:
+        raise ValueError("台词已更新，请刷新后再保存。")
+    defaults = {"chapter_id": None, "character_id": None, "type": "dialogue", "text": "", "source": "user",
+                "source_refs": [], "emotion": "", "tone": "", "status": "pending"}
+    fields = defaults.keys()
+    record = {**defaults, **{k: existing[k] for k in fields if existing and k in existing},
+              **{k: values[k] for k in fields if k in values}}
+    if record["chapter_id"] not in {chapter["id"] for chapter in project["chapters"]}:
+        raise ValueError("台词所属章节不存在。")
+    if existing and record["chapter_id"] != existing["chapter_id"]:
+        raise ValueError("不能更改台词所属章节。")
+    if record["character_id"] is not None:
+        character = asset_by_id(project, record["character_id"])
+        if not character or character["kind"] != "character":
+            raise ValueError("台词说话人不存在。")
+    if record["type"] not in ("dialogue", "narration", "voiceover", "inner") or record["source"] not in ("original", "adapted", "user") or record["status"] not in ("pending", "confirmed"):
+        raise ValueError("台词类型、来源或状态无效。")
+    if not isinstance(record["text"], str) or not record["text"].strip() or any(not isinstance(record[k], str) for k in ("emotion", "tone")):
+        raise ValueError("请填写有效台词。")
+    if not isinstance(record["source_refs"], list):
+        raise ValueError("台词原文定位无效。")
+    if record["source_refs"]:
+        check_sources(project, record["source_refs"])
+    if existing:
+        old_text = existing["text"]
+        history = existing.setdefault("history", [])
+        history.append({k: v for k, v in existing.items() if k != "history"})
+        if record["text"] != old_text:
+            record["source"] = "user"
+            record["status"] = "pending"
+            for shot in project["shots"]:
+                for link in shot.get("dialogue_links", []):
+                    if link.get("dialogue_id") == existing["id"]:
+                        link["needs_review"] = True
+        existing.update(record, revision=existing["revision"] + 1)
+    else:
+        dialogues.append({**record, "id": new_id(), "revision": 1, "history": []})
+    project["dialogue_revision"] = project.get("dialogue_revision", 0) + 1
+
+
+def save_dialogue_links(project, shot_id, links):
+    shot = next((item for item in project["shots"] if item["id"] == shot_id), None)
+    if shot is None or not isinstance(links, list):
+        raise ValueError("镜头或台词关联无效。")
+    dialogues = {item["id"]: item for item in project.get("dialogues", [])}
+    previous = shot.get("dialogue_links", [])
+    result = []
+    for link in links:
+        if not isinstance(link, dict):
+            raise ValueError("台词关联无效。")
+        dialogue = dialogues.get(link.get("dialogue_id"))
+        if not dialogue or dialogue["chapter_id"] != shot["chapter_id"]:
+            raise ValueError("关联的台词不存在或不属于本章。")
+        start, end = link.get("start"), link.get("end")
+        old = next((item for item in previous if item.get("dialogue_id") == dialogue["id"] and item.get("start") == start and item.get("end") == end), None)
+        valid = start is None and end is None or (type(start) is int and type(end) is int and 0 <= start < end <= len(dialogue["text"]))
+        if not valid and not (old and old.get("needs_review") and not link.get("confirm_range")):
+            raise ValueError("台词范围无效；请按 Unicode 字符位置重新选择。")
+        mode = link.get("mode", "start")
+        if mode not in ("start", "continue", "audio_only", "finish") or not isinstance(link.get("show_subtitle", True), bool):
+            raise ValueError("台词承接方式或字幕设置无效。")
+        needs_review = (start is None and mode != "audio_only") or not valid or bool(link.get("needs_review", False))
+        if any(item.get("dialogue_id") == dialogue["id"] and item.get("needs_review") for item in previous) and not link.get("confirm_range"):
+            needs_review = True
+        result.append({"dialogue_id": dialogue["id"], "start": start, "end": end, "mode": mode,
+                       "show_subtitle": link.get("show_subtitle", True), "needs_review": needs_review})
+    shot["dialogue_links"] = result
+    project["dialogue_revision"] = project.get("dialogue_revision", 0) + 1
+
+
 def shot_bindings(shot):
     bindings = []
     if shot.get("scene"):
@@ -132,7 +236,10 @@ def shot_bindings(shot):
 def validate_shot(project, shot):
     if shot["chapter_id"] not in {c["id"] for c in project["chapters"]}:
         raise ValueError("镜头所属章节不存在。")
-    check_sources(project, shot["source_refs"])
+    if shot.get("source_refs"):
+        check_sources(project, shot["source_refs"])
+    elif not shot.get("source_refs_needs_review"):
+        raise ValueError("分析条目缺少原文定位。")
     if not isinstance(shot.get("image_prompt"), str) or not shot["image_prompt"].strip():
         raise ValueError("请填写镜头提示词。")
     for item in shot_bindings(shot):
@@ -214,6 +321,17 @@ def merge_asset(project, source_id, target_id):
     for asset in project["assets"]:
         if asset.get("parent_id") == source_id:
             asset["parent_id"] = target_id
+    if source["kind"] == "character":
+        if source.get("voice_versions"):
+            target.setdefault("voice_versions", []).extend(source["voice_versions"])
+            target.setdefault("current_voice_id", source.get("current_voice_id"))
+        changed_dialogues = False
+        for dialogue in project.get("dialogues", []):
+            if dialogue.get("character_id") == source_id:
+                dialogue["character_id"] = target_id
+                changed_dialogues = True
+        if changed_dialogues:
+            project["dialogue_revision"] = project.get("dialogue_revision", 0) + 1
     affected = []
     for shot in project["shots"]:
         for item in shot_bindings(shot):
@@ -323,7 +441,10 @@ class Store:
             rows = db.execute("SELECT id, data FROM jobs").fetchall()
             for job_id, raw in rows:
                 job = json.loads(raw)
-                if job["status"] in ("running", "analysing", "cancelling"):
+                if job["status"] == "queued" and job.get("background"):
+                    job.update(status="cancelled", error="服务已重启，图片请求尚未发出。")
+                    db.execute("UPDATE jobs SET data=? WHERE id=?", (json.dumps(job, ensure_ascii=False), job_id))
+                elif job["status"] in ("running", "analysing", "cancelling"):
                     job.update(status="unknown", error="服务已重启，远端结果未知。未自动重试。")
                     db.execute("UPDATE jobs SET data=? WHERE id=?", (json.dumps(job, ensure_ascii=False), job_id))
 
@@ -346,3 +467,22 @@ class Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         image.save(path, format="PNG")
         return {"file": relative, "hash": image_hash(image), "width": image.width, "height": image.height}
+
+    def save_voice(self, project_id, data):
+        if not re.fullmatch(r"[0-9a-f]{32}", project_id) or not data or len(data) > 20 * 1024 * 1024:
+            raise ValueError("声线音频不能为空或超过20MB。")
+        if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+            suffix = "wav"
+        elif data[:4] == b"fLaC":
+            suffix = "flac"
+        elif data[:3] == b"ID3" or len(data) > 1 and data[0] == 0xff and data[1] & 0xe0 == 0xe0:
+            suffix = "mp3"
+        elif data[4:8] == b"ftyp":
+            suffix = "m4a"
+        else:
+            raise ValueError("声线音频请选择 WAV、MP3、M4A 或 FLAC。")
+        relative = f"astrogate/{project_id}/voices/{new_id()}.{suffix}"
+        path = self.image_path(relative)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return {"id": new_id(), "file": relative, "sha256": hashlib.sha256(data).hexdigest(), "created_at": time.time()}

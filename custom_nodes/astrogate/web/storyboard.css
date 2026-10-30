@@ -38,6 +38,13 @@
 .ag-atmosphere{display:block;color:#9eb3c4;font-size:11px}
 .ag-native .ag-atmosphere textarea{height:58px}
 .ag-hint{color:#92a8b9;font-size:11px;margin:5px 0;overflow-wrap:anywhere}
+.ag-dialogue-row{border-bottom:1px solid #435463;padding:8px 0;margin-bottom:8px}
+.ag-dialogue-row strong{display:block;margin:6px 0;color:#d0e5f4}
+.ag-dialogue-row label{display:inline-flex;align-items:center;gap:5px;margin:4px;color:#acc3d4;font-size:11px}
+.ag-dialogue select,.ag-dialogue input:not([type=checkbox]){box-sizing:border-box;max-width:130px;background:#202b36;color:#e7eef5;border:1px solid #435463;border-radius:4px;padding:4px;font-size:11px}
+.ag-dialogue-preview{margin:6px 0;color:#a6d7f1;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px}
+.ag-scene-review{border:1px solid #bc7869;border-radius:5px;padding:7px;margin-top:8px}
+.ag-scene-review select{display:block;box-sizing:border-box;width:100%;margin:7px 0;background:#202b36;color:#e7eef5;border:1px solid #435463;border-radius:4px;padding:5px}
 .ag-file-info{white-space:pre-wrap;max-height:64px;overflow:auto;margin-bottom:10px;color:#bcd3e5}
 .ag-activity{position:fixed;left:76px;bottom:20px;z-index:45;width:300px;max-width:calc(100vw - 100px);box-sizing:border-box;background:#18212bed;color:#e1e8ed;border:1px solid #405265;border-radius:9px;box-shadow:0 5px 22px #0005;font:12px/1.5 system-ui,sans-serif}
 .ag-activity[open]{width:380px}

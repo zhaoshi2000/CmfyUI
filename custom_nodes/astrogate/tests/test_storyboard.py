@@ -70,6 +70,60 @@ def test_long_paragraph_chunks_keep_identity_without_duplicate_text(modules):
     assert "".join(c[0]["text"] for c in result) == p[0]["text"]
 
 
+def test_sentence_chunks_preserve_quote_and_source_offsets_with_legacy_boundaries(modules):
+    text = '甲' * 790 + '。' + '乙' * 500 + '“' + '台词' * 200 + '！”' + '丙' * 900 + '。'
+    paragraph = {"id": "p", "text": text}
+    pieces = [item for batch in modules.domain.chunks([paragraph], limit=1500, prefer_sentences=True) for item in batch]
+    assert ''.join(item['text'] for item in pieces) == text
+    assert all(item['id'] == 'p' and text[item['slice_start']:item['slice_start'] + len(item['text'])] == item['text'] for item in pieces)
+    assert any('“' + '台词' * 200 + '！”' in item['text'] for item in pieces)
+    assert pieces[0]['text'].endswith('。')
+    legacy_text = text * 4
+    legacy = [item for batch in modules.domain.chunks([{"id": "p", "text": legacy_text}], limit=6000) for item in batch]
+    assert [item['slice_start'] for item in legacy] == list(range(0, len(legacy_text), 6000))
+
+
+def test_sentence_chunks_do_not_split_an_oversized_quoted_line(modules):
+    quote = '“' + '😀' * 1700 + '。”'
+    text = '前情。' + quote + '后续。'
+    pieces = [item['text'] for batch in modules.domain.chunks([{"id": "p", "text": text}], limit=1500, prefer_sentences=True) for item in batch]
+    assert ''.join(pieces) == text
+    assert any(quote in item for item in pieces)
+
+
+def test_shared_dialogue_ranges_preserve_images_and_require_review_after_edit(modules, project):
+    d, p = modules.domain, project
+    shot = p["shots"][0]
+    shot["stale"] = False
+    other = copy.deepcopy(shot)
+    other["id"] = "shot2"
+    p["shots"].append(other)
+    d.save_dialogue(p, {"chapter_id": shot["chapter_id"], "character_id": "周野", "text": "你先走👋，我来挡住他们。"})
+    dialogue = p["dialogues"][0]
+    d.save_dialogue_links(p, shot["id"], [{"dialogue_id": dialogue["id"], "start": 0, "end": 4, "mode": "start"}])
+    d.save_dialogue_links(p, other["id"], [{"dialogue_id": dialogue["id"], "start": 4, "end": 11, "mode": "finish"}])
+    assert dialogue["text"][shot["dialogue_links"][0]["start"]:shot["dialogue_links"][0]["end"]] == "你先走👋"
+    d.save_dialogue(p, {"id": dialogue["id"], "revision": 1, "text": "你先离开。"})
+    assert dialogue["history"][0]["text"] == "你先走👋，我来挡住他们。"
+    assert all(item["dialogue_links"][0]["needs_review"] for item in (shot, other))
+    assert not shot["stale"] and not other["stale"]
+    d.save_dialogue_links(p, other["id"], other["dialogue_links"])
+    assert other["dialogue_links"][0]["needs_review"]
+    with pytest.raises(ValueError, match="范围无效"):
+        d.save_dialogue_links(p, other["id"], [{"dialogue_id": dialogue["id"], "start": 4, "end": 12}])
+    with pytest.raises(ValueError, match="台词已更新"):
+        d.save_dialogue(p, {"id": dialogue["id"], "revision": 1, "text": "旧版本"})
+
+
+def test_dialogue_links_reject_wrong_chapter_and_allow_legacy_empty(modules, project):
+    d, p = modules.domain, project
+    p.pop("dialogues")
+    d.save_dialogue_links(p, "shot1", [])
+    d.save_dialogue(p, {"chapter_id": p["chapters"][1]["id"], "text": "你好"})
+    with pytest.raises(ValueError, match="不属于本章"):
+        d.save_dialogue_links(p, "shot1", [{"dialogue_id": p["dialogues"][0]["id"]}])
+
+
 def test_version_updates_only_following_shots_and_explicit_descendants(modules, project):
     p, d = project, modules.domain
     locked = copy.deepcopy(p["shots"][0])
@@ -167,10 +221,12 @@ def test_unknown_jobs_never_automatically_retry(modules, project):
 def test_restart_marks_inflight_unknown_and_preserves_success(modules, project):
     first = modules.store.add_job(project["id"], {"status": "running"})
     second = modules.store.add_job(project["id"], {"status": "succeeded"})
+    waiting = modules.store.add_job(project["id"], {"status": "queued", "background": True})
     restarted = modules.domain.Store(modules.store.root, modules.store.input_dir)
     restarted.recover()
     assert restarted.job(first["id"])["status"] == "unknown"
     assert restarted.job(second["id"])["status"] == "succeeded"
+    assert restarted.job(waiting["id"])["status"] == "cancelled"
 
 
 async def test_generation_persists_and_reuses_after_restart(modules, project, monkeypatch, tmp_path):
@@ -366,6 +422,20 @@ async def test_text_stream_handles_split_utf8_keepalive_and_usage(modules, aioht
     assert all('雨夜' not in (event or '') for event, _ in progress)
 
 
+async def test_text_stream_limits_content_instead_of_discarded_reasoning(modules):
+    class Lines:
+        def __aiter__(self):
+            async def generate():
+                for _ in range(300):
+                    yield b'data: {"choices":[{"delta":{"reasoning":"' + b'x' * 16000 + b'"}}]}\n'
+                yield b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n'
+                yield b'data: [DONE]\n'
+            return generate()
+    response = SimpleNamespace(content=Lines())
+    text, _ = await modules.analysis.read_text_stream(response)
+    assert text == 'ok'
+
+
 @pytest.mark.parametrize("ending,error", [
     ("", "结果未知"),
     ('data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n', "被截断"),
@@ -400,6 +470,26 @@ async def test_configured_text_timeout_stays_unknown_without_retry(modules, aioh
     monkeypatch.setenv("ASTROGATE_TEXT_TIMEOUT", "0.03")
     with pytest.raises(RuntimeError, match="结果未知"):
         await modules.analysis.text_request("gpt-5.6-terra", "system", {})
+    assert len(calls) == 1
+
+
+async def test_text_idle_timeout_does_not_retry(modules, aiohttp_server, monkeypatch):
+    calls = []
+    async def handle(request):
+        calls.append(await request.json())
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"choices":[{"delta":{"content":"x"}}]}\n\n')
+        await asyncio.sleep(0.1)
+        return response
+    app = web.Application()
+    app.router.add_post("/chat/completions", handle)
+    server = await aiohttp_server(app)
+    monkeypatch.setattr(modules.analysis, "TEXT_BASE", str(server.make_url("/")).rstrip("/"))
+    monkeypatch.setenv("ASTROGATE_TEXT_API_KEY", "text-only")
+    monkeypatch.setenv("ASTROGATE_TEXT_IDLE_TIMEOUT", "0.03")
+    with pytest.raises(RuntimeError, match="结果未知"):
+        await modules.analysis.text_request("gpt-6-luna", "system", {})
     assert len(calls) == 1
 
 
@@ -794,6 +884,35 @@ async def test_image_recovery_requires_unknown_job_and_project_owner(modules, pr
     assert response.status==400 and '不支持' in (await response.json())['error']
 
 
+async def test_background_image_route_queues_once_and_checks_owner(modules, project, monkeypatch, aiohttp_client):
+    service = sys.modules[modules.node.__name__ + '.storyboard.service']
+    routes = web.RouteTableDef()
+    monkeypatch.setattr(service, 'PromptServer', SimpleNamespace(instance=SimpleNamespace(routes=routes,
+        user_manager=SimpleNamespace(get_request_user_id=lambda request: request.headers.get('X-Test-User', 'default')))))
+    monkeypatch.setattr(service, 'get_store', lambda: modules.store)
+    release = asyncio.Event()
+    started = []
+
+    async def run(job_id):
+        started.append(job_id)
+        await release.wait()
+
+    service.register_routes(None, run)
+    app = web.Application()
+    app.add_routes(routes)
+    client = await aiohttp_client(app)
+    job = modules.store.add_job(project['id'], {'kind': 'image', 'native': True, 'references': []})
+    path = '/astrogate/storyboard/jobs/' + job['id'] + '/start'
+    assert (await client.post(path, headers={'X-Test-User': 'other'})).status == 400
+    response = await client.post(path)
+    assert response.status == 200 and (await response.json())['status'] == 'queued'
+    assert (await client.post(path)).status == 400
+    assert modules.store.job(job['id'])['background'] is True
+    await asyncio.sleep(0)
+    assert started == [job['id']]
+    release.set()
+
+
 async def test_approving_legacy_views_preserves_history_without_reusing_them_as_sheets(modules, project, monkeypatch, aiohttp_client):
     native = sys.modules[modules.node.__name__ + '.storyboard.native']
     service = sys.modules[modules.node.__name__ + '.storyboard.service']
@@ -1062,6 +1181,8 @@ async def test_native_analysis_reuses_result_without_text_call(modules, project,
         store.update_job(job_id, status='succeeded')
     monkeypatch.setattr(native, 'analyse', analyse)
     first = await native.analyse_native(modules.store, project['id'], 1, 'gpt-5.6-terra', '写实', '精细', 0)
+    assert modules.store.job(first['analysis_id'])['chunk_limit'] == 700
+    assert modules.store.job(first['analysis_id'])['sentence_chunks'] is True
     assert first == await native.analyse_native(modules.store, project['id'], 1, 'gpt-5.6-terra', '写实', '精细', 0)
     assert len(calls) == 1
     await native.analyse_native(modules.store, project['id'], 1, 'gpt-5.6-terra', '写实', '精细', 1)
@@ -1190,6 +1311,50 @@ async def test_native_executor_parallel_images_wait_for_their_references(modules
     assert peak == 2 and finished == {'a','b','c','target'}
     assert all(modules.store.job(job['id'])['status'] == 'succeeded' for job in jobs.values())
     assert len({modules.store.job(job['id'])['result_image']['file'] for job in jobs.values()}) == 4
+
+
+async def test_background_images_finish_independently_when_one_request_stalls(modules, project, monkeypatch, tmp_path):
+    m = modules.node
+    native = sys.modules[m.__name__ + '.storyboard.native']
+    shots = [{**copy.deepcopy(project['shots'][0]), 'id': name} for name in ('slow', 'fast')]
+    project['shots'] = shots
+    modules.store.change(project['id'], lambda p: p.update(shots=shots))
+    jobs = {}
+    for shot in shots:
+        job = native.prepare_native(modules.store, project, {'owner_id': shot['id'], 'owner_type': 'shot',
+            'prompt': shot['image_prompt'], 'settings': {'resolution': 'original', 'aspect_ratio': '16:9', 'quality': 'high'}})
+        modules.store.update_job(job['id'], expected_status=('prepared',), status='queued')
+        jobs[shot['id']] = job
+    slow_started = asyncio.Event()
+    release_slow = asyncio.Event()
+    fast_done = asyncio.Event()
+    names = {job['gateway_request_id']: name for name, job in jobs.items()}
+
+    async def generate(payload, edit):
+        name = names[payload['gateway_request_id']]
+        if name == 'slow':
+            slow_started.set()
+            await release_slow.wait()
+        else:
+            await slow_started.wait()
+            fast_done.set()
+        data = BytesIO()
+        Image.new('RGB', (16, 9), 'blue').save(data, format='PNG')
+        return {'data': [{'b64_json': m.base64.b64encode(data.getvalue()).decode()}]}
+
+    monkeypatch.setattr(m, 'generate_image', generate)
+    monkeypatch.setattr(m, 'frame_queue', m.FrameQueue(2))
+    monkeypatch.setattr(m.folder_paths, 'output_directory', str(tmp_path / 'output'))
+    (tmp_path / 'output').mkdir()
+    slow = asyncio.create_task(m.generate_prepared_frame(jobs['slow']['id']))
+    fast = asyncio.create_task(m.generate_prepared_frame(jobs['fast']['id']))
+    await asyncio.wait_for(fast_done.wait(), 2)
+    await asyncio.wait_for(fast, 2)
+    assert modules.store.job(jobs['fast']['id'])['status'] == 'succeeded'
+    assert modules.store.job(jobs['slow']['id'])['status'] == 'running'
+    release_slow.set()
+    await asyncio.wait_for(slow, 2)
+    assert modules.store.job(jobs['slow']['id'])['status'] == 'succeeded'
 
 
 @pytest.mark.parametrize('failure', ['before_request', 'unknown'])

@@ -12,7 +12,8 @@ from server import PromptServer
 from .analysis import MODELS, analyse
 from .graph import draft_canvas, plan, prepare
 from .native import native_canvas, prepare_native
-from .store import Store, aspect_ratio, asset_by_id, invalidate, merge_asset, new_id, parse_novel, publish_version, validate_shot, version
+from .store import Store, aspect_ratio, asset_by_id, binding, invalidate, merge_asset, new_id, parse_novel, publish_version, save_dialogue, save_dialogue_links, validate_shot, version
+from .video import video_prompt
 
 
 _store = None
@@ -52,7 +53,7 @@ def queue_failure(job, history, jobs=None):
     return "blocked", "队列已结束，此图片尚未执行。请检查参考图是否已生成。"
 
 
-def register_routes(recover_image=None):
+def register_routes(recover_image=None, generate_image=None):
     server = PromptServer.instance
     store = get_store()
     tasks = {}
@@ -111,7 +112,7 @@ def register_routes(recover_image=None):
         jobs = [{k: v for k, v in j.items() if k not in ("snapshot", "responses", "prompt", "references")}
                 for j in store.jobs(project["id"])]
         if request.query.get("summary") == "1":
-            return web.json_response({"revision": project["revision"], "jobs": jobs})
+            return web.json_response({"revision": project["revision"], "dialogue_revision": project.get("dialogue_revision", 0), "jobs": jobs})
         return web.json_response({"project": project, "jobs": jobs})
 
     @route("POST", "/projects/{project}/edit")
@@ -121,7 +122,57 @@ def register_routes(recover_image=None):
 
         def change(p):
             action = body["action"]
-            if action == "frame_aspect_ratio":
+            if action == "dialogue_save":
+                save_dialogue(p, body["dialogue"])
+            elif action == "dialogue_links":
+                save_dialogue_links(p, body["shot_id"], body["links"])
+            elif action == "resolve_scene":
+                shot = next((s for s in p["shots"] if s["id"] == body["shot_id"]), None)
+                if shot is None or not shot.get("unresolved_scene_id"):
+                    raise ValueError("该镜头没有待确认的场景引用。")
+                scene_id = body.get("scene_id")
+                scene = asset_by_id(p, scene_id) if scene_id else None
+                if scene_id and (scene is None or scene["kind"] not in ("scene", "scene_state")):
+                    raise ValueError("请选择有效场景。")
+                shot["scene"] = binding(p, scene_id) if scene_id else None
+                shot.pop("unresolved_scene_id")
+                shot["revision"] += 1
+                invalidate(p, [shot["id"]])
+            elif action == "resolve_sources":
+                shot = next((s for s in p["shots"] if s["id"] == body["shot_id"]), None)
+                if shot is None or not shot.get("source_refs_needs_review"):
+                    raise ValueError("该镜头没有待确认的原文定位。")
+                chapter = next(c for c in p["chapters"] if c["id"] == shot["chapter_id"])
+                paragraph_id = body.get("paragraph_id")
+                if paragraph_id not in {paragraph["id"] for paragraph in chapter["paragraphs"]}:
+                    raise ValueError("请选择本章的原文段落。")
+                if not any(ref["paragraph_id"] == paragraph_id for ref in shot["source_refs"]):
+                    shot["source_refs"].append({"paragraph_id": paragraph_id, "quote": None})
+                shot["source_refs_needs_review"] = False
+                shot["revision"] += 1
+                invalidate(p, [shot["id"]])
+            elif action == "resolve_participant":
+                shot = next((s for s in p["shots"] if s["id"] == body["shot_id"]), None)
+                if shot is None or not shot.get("unresolved_participants"):
+                    raise ValueError("该镜头没有待确认的出镜人物。")
+                character_id = body.get("character_id")
+                character = asset_by_id(p, character_id) if character_id else None
+                if character_id and (character is None or character["kind"] != "character"):
+                    raise ValueError("请选择有效人物。")
+                person = shot["unresolved_participants"].pop(0)
+                if character:
+                    look = asset_by_id(p, person.get("look_id")) if person.get("look_id") else None
+                    if look and (look["kind"] != "look" or look.get("parent_id") != character_id):
+                        look = None
+                    shot["participants"].append({k: person.get(k, "") for k in ("screen_position", "action", "expression", "facing")}
+                                                | {"visible": True, "identity": binding(p, character_id),
+                                                   "look": binding(p, look["id"]) if look else None})
+                if not shot["unresolved_participants"]:
+                    shot.pop("unresolved_participants")
+                validate_shot(p, shot)
+                shot["revision"] += 1
+                invalidate(p, [shot["id"]])
+            elif action == "frame_aspect_ratio":
                 ratio = aspect_ratio(body["aspect_ratio"])
                 style = body.get("style", p["settings"]["style"])
                 if not isinstance(style, str):
@@ -223,6 +274,49 @@ def register_routes(recover_image=None):
         updated = store.change(project["id"], lambda p: publish_version(p, asset["id"], version(asset)["description"], image), project["revision"])
         return web.json_response(updated)
 
+    @route("POST", "/projects/{project}/assets/{asset}/voice")
+    async def upload_voice(request):
+        project = project_for(request)
+        asset = asset_by_id(project, request.match_info["asset"])
+        if asset is None or asset["kind"] != "character":
+            raise ValueError("请选择人物身份卡绑定声线。")
+        reader = await request.multipart()
+        field = await reader.next()
+        if field is None or not field.filename:
+            raise ValueError("请选择声线音频。")
+        data = bytearray()
+        while part := await field.read_chunk():
+            data.extend(part)
+            if len(data) > 20 * 1024 * 1024:
+                raise ValueError("声线音频不能超过20MB。")
+        voice = store.save_voice(project["id"], bytes(data))
+
+        def attach(p):
+            character = asset_by_id(p, asset["id"])
+            character.setdefault("voice_versions", []).append(voice)
+            character["current_voice_id"] = voice["id"]
+        return web.json_response(store.change(project["id"], attach, project["revision"]))
+
+    @route("GET", "/projects/{project}/assets/{asset}/voice/{voice}")
+    async def play_voice(request):
+        project = project_for(request)
+        asset = asset_by_id(project, request.match_info["asset"])
+        voice = next((item for item in asset.get("voice_versions", []) if item["id"] == request.match_info["voice"]), None) if asset and asset["kind"] == "character" else None
+        if not voice:
+            raise ValueError("人物声线不存在。")
+        path = store.image_path(voice["file"])
+        if not path.is_file():
+            raise ValueError("人物声线文件不存在。")
+        return web.FileResponse(path)
+
+    @route("GET", "/projects/{project}/video-prompt")
+    async def get_video_prompt(request):
+        project = project_for(request)
+        chapter_id = request.query.get("chapter_id")
+        if chapter_id not in {chapter["id"] for chapter in project["chapters"]}:
+            raise ValueError("章节不存在。")
+        return web.json_response(video_prompt(project, chapter_id, request.query.get("analysis_id") or None, store.jobs(project["id"])))
+
     @route("POST", "/projects/{project}/analyse")
     async def start_analysis(request):
         project = project_for(request)
@@ -237,7 +331,7 @@ def register_routes(recover_image=None):
             raise ValueError("本章已有分析记录。可继续编辑现有镜头，或明确选择重新分析（保留旧镜头）。")
         settings = project["settings"]
         job = store.add_job(project["id"], {"kind": "text", "chapter_id": chapter_id, "model": settings["text_model"],
-                                             "style": settings["style"], "density": settings["density"], "include_props": settings.get("include_props", False)})
+                                             "style": settings["style"], "density": settings["density"], "include_props": settings.get("include_props", False), "chunk_limit": 700, "sentence_chunks": True})
         task = asyncio.create_task(analyse(store, job["id"]))
         tasks[job["id"]] = task
         task.add_done_callback(lambda _: tasks.pop(job["id"], None))
@@ -316,6 +410,21 @@ def register_routes(recover_image=None):
         return web.json_response(store.update_job(job["id"], expected_status=("prepared", "succeeded"),
                                                   prompt_id=data["prompt_id"], status=job["status"]))
 
+    @route("POST", "/jobs/{job}/start")
+    async def start_image(request):
+        job = job_for(request)
+        if generate_image is None or job["kind"] != "image" or not job.get("native"):
+            raise ValueError("当前图片任务不能后台生成。")
+        if any(not ref.get("job_id") for ref in job["references"]):
+            raise ValueError("外部图片参考需通过画布运行。")
+        if job["id"] in tasks or job["status"] != "prepared":
+            raise ValueError("该图片任务已经提交，请查看任务状态。")
+        store.update_job(job["id"], expected_status=("prepared",), status="queued", background=True)
+        task = asyncio.create_task(generate_image(job["id"]))
+        tasks[job["id"]] = task
+        task.add_done_callback(lambda _: tasks.pop(job["id"], None))
+        return web.json_response({"status": "queued"})
+
     @route("POST", "/jobs/{job}/cancel")
     async def cancel(request):
         job = job_for(request)
@@ -349,12 +458,23 @@ def register_routes(recover_image=None):
             archive.writestr("source.txt", project["source"]["text"])
             archive.writestr("project.json", json.dumps(project, ensure_ascii=False, indent=2))
             archive.writestr("generations.json", json.dumps(jobs, ensure_ascii=False, indent=2))
+            for chapter in project["chapters"]:
+                latest = next((shot for shot in reversed(project["shots"]) if shot["chapter_id"] == chapter["id"]), None)
+                if latest:
+                    video = video_prompt(project, chapter["id"], latest.get("analysis_id"), jobs)
+                    archive.writestr(f"video_prompts/{chapter['id']}.txt", video["prompt"])
+                    archive.writestr(f"video_prompts/{chapter['id']}.json", json.dumps({key: video[key] for key in ("images", "audios", "warnings", "shot_ids")}, ensure_ascii=False, indent=2))
             images = {v["image"]["file"] for a in project["assets"] for v in a["versions"] if v.get("image")}
             images.update(j["result_image"]["file"] for j in jobs if j.get("result_image"))
             for relative in sorted(images):
                 source = store.image_path(relative)
                 if source.is_file():
                     archive.write(source, "input/" + relative)
+            for asset in project["assets"]:
+                for voice in asset.get("voice_versions", []):
+                    source = store.image_path(voice["file"])
+                    if source.is_file():
+                        archive.write(source, "input/" + voice["file"])
             for chapter_id, workflow in project["workflows"].items():
                 archive.writestr(f"workflows/{chapter_id}.json", json.dumps(workflow, ensure_ascii=False))
             for index, shot in enumerate(project["shots"], 1):
