@@ -157,6 +157,21 @@ test("native board creates real image/story wires, shares assets and preserves m
     assert.deepEqual(first.pos, [900, 420]);
     assert.equal(first.inputs.find(i => i.name === "reference_images.reference_1").link, null);
 });
+test("scene state default gains a new viewpoint without overwriting manual prompts", async () => {
+    const {graph, LiteGraph} = graphMock();
+    const board = LiteGraph.createNode("AstroGateStoryboard"); board.pos = [0, 0]; graph.add(board);
+    const {mountGraph, changed} = await load({registerExtension() {}, graph, nodeOutputs: {}}, {LiteGraph});
+    const recipe = {project_id: "p", chapter_id: "c", nodes: [{id: "state", type: "AstroGateStoryboardFrame", title: "清晨客栈",
+        pos: [500, 0], default_prompt: "清晨客栈，侧方机位", widgets: {prompt: "清晨客栈，正面机位", job_id: "saved-job"},
+        properties: {astrogate_project: "p", astrogate_key: "state", astrogate_kind: "scene_state", astrogate_base_prompt: "清晨客栈，正面机位"}}], links: []};
+    const card = mountGraph(board, recipe).get("state");
+    assert.equal(card.widgets[0].value, "清晨客栈，侧方机位");
+    assert.equal(card.widgets[1].value, "saved-job");
+    assert.equal(changed(card), false);
+    card.widgets[0].value = "用户自定机位";
+    mountGraph(board, recipe);
+    assert.equal(card.widgets[0].value, "用户自定机位");
+});
 test("existing shots drop redundant character views only when their look remains connected", async () => {
     const {graph, LiteGraph} = graphMock();
     graph.change = () => {};

@@ -6,6 +6,10 @@ from .graph import CHARACTER_SHEET_PROMPT, SCENE_MASTER_PROMPT, SCENE_STATE_PROM
 from .store import aspect_ratio, asset_by_id, binding, digest, invalidate, shot_bindings, version
 
 
+PREVIOUS_SCENE_MASTER_PROMPT = "无人环境素材：生成一张16:9连续的场景全景母图，24mm等效广角、平视机位，中远距离全景，在同一画面尽可能完整交代房间或场地的空间。室内清楚展示墙面、地面、顶面、门窗、通道及主要陈设的相对位置；室外对应展示地形、建筑、道路、植被及主要空间边界。结构与透视合理，画面边缘无明显拉伸，保留设定中的材质、布局、主要光源方向、色温和投影关系，以真实光照呈现，明确光照强度，不添加不合理的多方向光源，不加说明标记。画面中禁止出现任何人物、路人、人体、剪影或人物倒影；参考图中即使有人也必须移除。不绘制剧情事件，只用一个连续机位，不拼贴、不分屏、不做多角度拼图，无文字、标签或水印。"
+SCENE_ONLY_PROMPT = "无人环境素材：只绘制建筑、空间、陈设与光照，不出现任何人物、路人、剪影或人物倒影。"
+
+
 async def analyse_native(store, project_id, chapter_number, model, style, density, revision):
     project = store.get(project_id)
     if not 1 <= chapter_number <= len(project["chapters"]):
@@ -116,6 +120,7 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
 
     def add(owner, kind, prompt, position, job=None, key=None, view=""):
         key = key or owner["id"]
+        default_prompt = prompt
         if job and job["status"] == "succeeded":
             prompt = job["snapshot"]["shot"]["image_prompt"]
         props = {"astrogate_project": project["id"], "astrogate_owner": owner["id"], "astrogate_owner_type": "shot" if kind == "shot" else "asset",
@@ -144,6 +149,10 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
                       "pos": position, "color": colors[kind], "properties": props,
                       "widgets": {"prompt": prompt, "job_id": job["id"] if job else "", "element_id": owner["id"],
                                   "aspect_ratio": project["settings"]["aspect_ratio"] if kind == "shot" else "16:9", "resolution": "4K", "quality": "high"}})
+        if kind == "scene_state" and job:
+            previous = version(owner)["description"] + "\n" + PREVIOUS_SCENE_MASTER_PROMPT
+            if prompt in (previous, previous + "\n" + SCENE_ONLY_PROMPT):
+                nodes[-1]["default_prompt"] = default_prompt
         if parent:
             nodes[-1]["title"] = f"{parent['name']} / {owner['name']}"
         links.append({"from": "$board", "slot": 0, "to": key, "input": "board", "type": "ASTROGATE_BOARD", "label": "所属分镜脚本"})
@@ -184,7 +193,7 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
                 prompt += f"\n本卡基准造型：{look['name']}，{version(look, sheet_look['version_id'])['description']}"
             prompt += "\n" + CHARACTER_SHEET_PROMPT
         elif asset["kind"] in ("scene", "scene_state"):
-            prompt += "\n" + (SCENE_STATE_PROMPT if asset["kind"] == "scene_state" else SCENE_MASTER_PROMPT)
+            prompt += "\n" + (SCENE_STATE_PROMPT if asset["kind"] == "scene_state" else SCENE_MASTER_PROMPT) + "\n" + SCENE_ONLY_PROMPT
         add(asset, asset["kind"], prompt, positions[key], job, key, view)
         if key != asset["id"]:
             nodes[-1]["title"] += " · 固定版本"

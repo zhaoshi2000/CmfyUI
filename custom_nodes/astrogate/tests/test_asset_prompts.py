@@ -71,6 +71,24 @@ def test_scene_request_is_one_empty_continuous_environment_panorama(modules, pro
     assert '头部至胸部特写' not in prompt
 
 
+def test_finished_scene_state_offers_new_default_without_changing_saved_image(modules, project):
+    native = sys.modules[modules.node.__name__ + '.storyboard.native']
+    state = copy.deepcopy(modules.domain.asset_by_id(project, '客栈'))
+    state.update(id='清晨客栈', name='清晨客栈', kind='scene_state', parent_id='客栈', current_version_id='清晨客栈1')
+    state['versions'][0].update(id='清晨客栈1', description='清晨光线照入客栈')
+    project['assets'].append(state)
+    project['shots'][0]['scene'] = modules.domain.binding(project, state['id'])
+    previous = state['versions'][0]['description'] + '\n' + native.PREVIOUS_SCENE_MASTER_PROMPT + '\n' + native.SCENE_ONLY_PROMPT
+    job = modules.store.add_job(project['id'], {'kind': 'image', 'status': 'succeeded', 'owner_id': state['id'],
+        'owner_type': 'asset', 'asset_version_id': state['current_version_id'], 'asset_view': '',
+        'snapshot': {'shot': {'image_prompt': previous}}, 'saved_result': {'filename': 'old.png', 'subfolder': '', 'type': 'input'}})
+    recipe = native.native_canvas(modules.store, project, project['chapters'][0]['id'])
+    card = next(item for item in recipe['nodes'] if item['id'] == state['id'])
+    assert card['widgets']['job_id'] == job['id']
+    assert card['widgets']['prompt'] == previous
+    assert '与母图明显不同的空间透视' in card['default_prompt']
+
+
 def test_shot_references_interpret_sheet_as_one_person_and_preserve_scene_layout(modules, project):
     shot = copy.deepcopy(project['shots'][0])
     shot.update(shot_size='手与钥匙的特写', camera_angle='俯拍', frozen_moment='钥匙触及地图的一瞬')

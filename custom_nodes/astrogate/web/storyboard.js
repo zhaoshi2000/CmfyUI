@@ -552,6 +552,12 @@ function mountGraph(board, recipe, relayout = false) {
                 upgrade.add(node);
             }
         }
+        if (item.default_prompt && value(node, "prompt") === node.properties.astrogate_base_prompt) {
+            const unchanged = !changed(node);
+            setValue(node, "prompt", item.default_prompt);
+            node.properties.astrogate_base_prompt = item.default_prompt;
+            if (unchanged && node.properties.astrogate_signature) node.properties.astrogate_signature = nodeSignature(node);
+        }
         if (item.properties.astrogate_kind === "shot" && node.properties.astrogate_atmosphere === undefined) node.properties.astrogate_atmosphere = item.properties.astrogate_atmosphere || "";
         node.properties.astrogate_chapter = recipe.chapter_id;
         node.agRefresh?.();
