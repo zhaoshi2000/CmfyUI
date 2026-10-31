@@ -737,6 +737,7 @@ function changed(node) {
         (p.astrogate_signature && p.astrogate_signature !== nodeSignature(node)));
 }
 let submitting = false;
+const automaticRequeues = new Set();
 async function generate(targets, force = false, reporter = targets[0]) {
     targets = targets.filter(n => n.type === "AstroGateStoryboardFrame");
     if (!targets.length) throw new Error("请先选中分镜图片卡片。");
@@ -757,11 +758,9 @@ async function generate(targets, force = false, reporter = targets[0]) {
             issue = {source: node, jobId, reason: "场景引用待确认，请在卡片中选择场景或确认按文字生成。"};
         } else if (node.properties.astrogate_unresolved_source) {
             issue = {source: node, jobId, reason: "原文定位待确认，请在卡片中选择对应段落。"};
-        } else if (node.properties.astrogate_unresolved_people) {
-            issue = {source: node, jobId, reason: "出镜人物待确认，请在卡片中选择人物或确认按文字生成。"};
         } else if (previous && active.has(previous.status)) {
             issue = {source: node, jobId, reason: "已有任务正在进行，请等待结束后再生成。"};
-        } else if (previous?.status === "unknown" && !(requested && force && targets.length === 1)) {
+        } else if (previous?.status === "unknown" && !(requested && force)) {
             issue = {source: node, jobId, reason: "上次结果未知；请先确认结果，或在此卡片点击“重绘”。"};
         } else if (!(previous?.status === "succeeded" && (!requested || !changed(node)) && !(requested && force))) {
             for (const ref of imageSources(node)) {
@@ -977,8 +976,15 @@ function installBoard(node) {
     }), button(node, "生成本章图片", async () => {
         const info = node.properties.astrogate_board;
         if (!info) throw new Error("请先分析剧本。");
-        await generate(nodes().filter(n => n.properties.astrogate_project === info.project_id && n.properties.astrogate_chapter === info.chapter_id &&
-            (n.properties.astrogate_kind === "shot" || n.properties.astrogate_kind === "character")), false, node);
+        const {jobs} = await request(`/projects/${info.project_id}?summary=1`);
+        const byId = new Map(jobs.map(job => [job.id, job]));
+        const targets = nodes().filter(n => {
+            if (n.type !== "AstroGateStoryboardFrame" || n.properties.astrogate_project !== info.project_id || n.properties.astrogate_chapter !== info.chapter_id) return false;
+            const job = byId.get(value(n, "job_id"));
+            return !job || (!active.has(job.status) && (job.status !== "succeeded" || changed(n)));
+        });
+        if (targets.length) await generate(targets, true, node);
+        else message(node, "本章图片已完成，或仍在生成中。");
     }), button(node, "复制本章视频提示词", async () => {
         const info = node.properties.astrogate_board;
         if (!info) throw new Error("请先分析剧本。");
@@ -1301,7 +1307,7 @@ function installFrame(node) {
         }
         if (unresolvedPeople) {
             const person = shot.unresolved_participants[0];
-            peopleLabel.textContent = `出镜人物待确认：AI 引用 ${person.character_id || "空 ID"}，动作：${person.action || "未描述"}。确认前此镜不会自动生成。`;
+            peopleLabel.textContent = `出镜人物待确认：AI 引用 ${person.character_id || "空 ID"}，动作：${person.action || "未描述"}。本镜先按文字生成，确认人物后可重绘并加入人物参考。`;
             const current = peoplePicker.value;
             const choices = [["", "选择已有角色"], ...(project.assets || []).filter(item => item.kind === "character" && !item.redirect_to).map(item => [item.id, item.name]),
                 ["text_only", "仅按文字生成（不连人物参考）"]];
@@ -1351,7 +1357,7 @@ function installFrame(node) {
 async function poll() {
     const activityEntries = [];
     let activityError = "";
-    const frames = nodes().filter(n => n.type === "AstroGateStoryboardFrame" && value(n, "job_id"));
+    const frames = nodes().filter(n => n.type === "AstroGateStoryboardFrame");
     const boards = nodes().filter(n => n.type === "AstroGateStoryboard");
     const projects = new Set([...frames.map(n => n.properties.astrogate_project), ...boards.map(n => value(sourceNode(n, "script") || {}, "project_id"))].filter(Boolean));
     for (const project of projects) {
@@ -1403,6 +1409,24 @@ async function poll() {
                     await buildBoard(node, {project_id: project, chapter_id: job.chapter_id, analysis_id: job.id});
                     delete node.properties.astrogate_partial_progress;
                 }
+            }
+            if (!submitting) {
+                const requeue = [];
+                for (const node of frames.filter(n => n.properties.astrogate_project === project)) {
+                    const job = jobs.get(value(node, "job_id"));
+                    const board = sourceNode(node, "board");
+                    const references = imageSources(node).filter(ref => ref.node.type === "AstroGateStoryboardFrame");
+                    const ready = references.every(ref => jobs.get(value(ref.node, "job_id"))?.status === "succeeded");
+                    const missing = !job &&
+                        board?.properties.astrogate_auto_started === board?.properties.astrogate_board?.analysis_id;
+                    const blocked = job?.status === "blocked" && ready;
+                    if ((!missing && !blocked) || node.properties.astrogate_unresolved_scene || node.properties.astrogate_unresolved_source || !ready) continue;
+                    const key = `${project}:${board?.properties.astrogate_board?.analysis_id || ""}:${node.id}`;
+                    if (automaticRequeues.has(key)) continue;
+                    automaticRequeues.add(key);
+                    requeue.push(node);
+                }
+                if (requeue.length) generate(requeue).catch(error => message(requeue[0], error.message, false, true));
             }
         } catch (error) {
             activityError = `状态读取失败：${error.message}`;

@@ -229,8 +229,6 @@ def prepare_native(store, project, body):
             raise ValueError("本镜场景引用待确认，请先在分镜卡选择场景或确认按文字生成。")
         if shot.get("source_refs_needs_review"):
             raise ValueError("本镜原文定位待确认，请先在分镜卡选择对应段落。")
-        if shot.get("unresolved_participants"):
-            raise ValueError("本镜出镜人物待确认，请先在分镜卡选择人物或确认按文字生成。")
         shot = copy.deepcopy(shot)
     elif kind == "asset":
         asset = asset_by_id(project, owner_id)

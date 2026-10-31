@@ -67,17 +67,21 @@ test("unconfirmed scene skips its image without submitting a request", async () 
     assert.match(node.properties.astrogate_status, /场景引用待确认/);
     assert.equal(calls.length, 0);
 });
-test("unconfirmed person skips its image without submitting a request", async () => {
+test("unconfirmed person queues a text-only image and keeps the review marker", async () => {
     const {graph, LiteGraph} = graphMock(); graph.change = () => {};
     const node = LiteGraph.createNode("AstroGateStoryboardFrame"); graph.add(node);
     node.title = "待确认人物";
     node.properties = {astrogate_project: "p", astrogate_kind: "shot", astrogate_unresolved_people: true};
     const calls = [];
     const app = {registerExtension() {}, graph, nodeOutputs: {}};
-    const {generate} = await load(app, {FormData: class {}}, {fetchApi: async (...args) => { calls.push(args); throw new Error("unexpected request"); }});
+    const {generate} = await load(app, {FormData: class {}}, {fetchApi: async (path, options) => {
+        calls.push([path, options?.body ? JSON.parse(options.body) : null]);
+        return {ok: true, json: async () => path.endsWith("/native/prepare") ? {id: "text-only", status: "prepared", references: []} : {}};
+    }});
     await generate([node]);
-    assert.match(node.properties.astrogate_status, /出镜人物待确认/);
-    assert.equal(calls.length, 0);
+    assert.deepEqual(calls.find(([path]) => path.endsWith("/native/prepare"))[1].references, []);
+    assert.equal(calls.filter(([path]) => path.endsWith("/jobs/text-only/start")).length, 1);
+    assert.equal(node.properties.astrogate_unresolved_people, true);
 });
 test("dialogue cards preserve shared edits and preview Unicode character ranges", async () => {
     const elements = [];
@@ -312,7 +316,7 @@ test('batch skips unknown and running branches but still queues independent targ
     assert.equal(running.widgets[1].value,'running-job');
 });
 
-test('all blocked targets do not submit work and only explicit single redraw retries an unknown result',async()=>{
+test('explicit batch retry queues an unknown source before its dependent frame',async()=>{
     const {graph,LiteGraph}=graphMock();
     const source=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(source);
     source.title='未知人物';source.widgets[0].value='人物';source.widgets[1].value='unknown-job';
@@ -327,19 +331,17 @@ test('all blocked targets do not submit work and only explicit single redraw ret
     const api={fetchApi:async(path,options)=>{
         const body=options?.body?JSON.parse(options.body):null;calls.push([path,body]);
         const result=path.endsWith('/jobs/unknown-job')?{id:'unknown-job',status:'unknown'}:
-            path.endsWith('/native/prepare')?{id:'redrawn',status:'prepared'}:{};
+            path.endsWith('/native/prepare')?{id:'redrawn-'+body.owner_id,status:'prepared',references:body.references}:{};
         return {ok:true,json:async()=>result};
     }};
     const app={registerExtension(){},graph,nodeOutputs:{},graphToPrompt:async()=>({output:{},workflow:{}})};
     const {generate}=await load(app,{LiteGraph,FormData:class{},crypto:{randomUUID:()=> 'batch-id'}},api);
     await generate([source,target],true);
-    assert.match(source.agStatus.textContent,/结果未知.*重绘/);
-    assert.match(target.agStatus.textContent,/未知人物.*结果未知/);
-    assert.equal(calls.some(([path])=>path==='/prompt'||path.endsWith('/native/prepare')),false);
-    await generate([source],true);
-    const body=calls.find(([path])=>path.endsWith('/native/prepare'))[1];
-    assert.equal(body.owner_id,'actor');assert.equal(body.force,true);
-    assert.equal(calls.filter(([path])=>path.endsWith('/jobs/redrawn/start')).length,1);
+    const prepared=calls.filter(([path])=>path.endsWith('/native/prepare')).map(([,body])=>body);
+    assert.deepEqual(prepared.map(body=>body.owner_id),['actor','shot']);
+    assert(prepared.every(body=>body.force));
+    assert.equal(prepared[1].references[0].job_id,'redrawn-actor');
+    assert.equal(calls.filter(([path])=>path.endsWith('/start')).length,2);
 });
 
 test('a skipped branch keeps its reason while the source is unresolved and clears it when resolved',async()=>{
@@ -508,6 +510,32 @@ test('completed resumed analysis automatically builds native nodes without anoth
     assert.equal(calls.some(([p])=>p.endsWith('/resume')||p==='/prompt'),false);
     await poll();
     assert.equal(calls.filter(([p])=>p.endsWith('/native/canvas')).length,1);
+});
+
+test('poll queues previously skipped shots once',async()=>{
+    const {graph,LiteGraph,board}=analysisGraph();
+    graph.serialize=()=>({});
+    board.properties.astrogate_board={project_id:'project',chapter_id:'chapter-id',analysis_id:'analysis'};
+    board.properties.astrogate_auto_started='analysis';
+    const shot=LiteGraph.createNode('AstroGateStoryboardFrame');graph.add(shot);
+    shot.title='未提交镜头';shot.widgets[0].value='人物站在门口';
+    shot.properties={astrogate_project:'project',astrogate_chapter:'chapter-id',astrogate_owner:'shot',
+        astrogate_owner_type:'shot',astrogate_kind:'shot',astrogate_base_prompt:'人物站在门口'};
+    shot.addInput('board','ASTROGATE_BOARD');board.connect(0,shot,0);
+    const calls=[];
+    const api={fetchApi:async(path,options)=>{
+        calls.push([path,options?.body?JSON.parse(options.body):null]);
+        const data=path.endsWith('?summary=1')?{jobs:[]}:
+            path.endsWith('/projects/project')?{project:{source:{hash:'source-hash'},chapters:[{id:'chapter-id'}]}}:
+            path.endsWith('/native/prepare')?{id:'queued-shot',status:'prepared',references:[]}:{};
+        return {ok:true,json:async()=>data};
+    }};
+    const {poll}=await load({registerExtension(){},graph,nodeOutputs:{}},{LiteGraph,FormData:class{}},api);
+    await poll();
+    await new Promise(resolve=>setTimeout(resolve,20));
+    assert.equal(calls.filter(([path])=>path.endsWith('/jobs/queued-shot/start')).length,1);
+    await poll();
+    assert.equal(calls.filter(([path])=>path.endsWith('/jobs/queued-shot/start')).length,1);
 });
 
 test('middle drag over card controls is forwarded to native canvas while left click stays editable',async()=>{

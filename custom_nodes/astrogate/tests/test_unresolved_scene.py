@@ -72,10 +72,12 @@ async def test_unknown_character_and_speaker_keep_draft_for_review(modules, proj
     recipe = native.native_canvas(modules.store, saved, chapter["id"], "analysis")
     card = next(item for item in recipe["nodes"] if item["id"] == shot["id"])
     assert card["properties"]["astrogate_unresolved_people"]
-    with pytest.raises(ValueError, match="出镜人物待确认"):
-        native.prepare_native(modules.store, saved, {"owner_id": shot["id"], "owner_type": "shot", "prompt": "林夏抬头", "settings": {}})
-    with pytest.raises(ValueError, match="出镜人物待确认"):
-        modules.graph.plan(modules.store, saved, [shot["id"]])
+    planned = modules.graph.plan(modules.store, saved, [shot["id"]], allow_missing=True)
+    assert planned["selected"] == [shot["id"]]
+    text_only = native.prepare_native(modules.store, saved, {"owner_id": shot["id"], "owner_type": "shot", "prompt": "林夏抬头", "settings": {}})
+    assert text_only["references"] == []
+    assert text_only["snapshot"]["shot"]["unresolved_participants"] == [person]
+    modules.store.update_job(text_only["id"], status="cancelled")
 
     service = sys.modules[modules.node.__name__ + ".storyboard.service"]
     routes = web.RouteTableDef()
