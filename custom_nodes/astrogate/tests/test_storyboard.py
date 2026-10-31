@@ -709,8 +709,19 @@ def test_character_sheets_have_stable_ids_layout_and_visible_cast_only(modules, 
         assert '头部至胸部特写' in sheet['widgets']['prompt'] and '背面三幅全身视图' in sheet['widgets']['prompt']
     assert all(n['widgets']['aspect_ratio']==('2.39:1' if n['properties']['astrogate_kind']=='shot' else '16:9') for n in recipe['nodes'])
     assert len({by_id[key]['color'] for key in ('林夏', '客栈', 'shot1')}) == 3
-    assert recipe['layout_version'] == recipe['reference_wiring_version'] == 4
+    assert recipe['layout_version'] == 5 and recipe['reference_wiring_version'] == 4
     assert len({tuple(n['pos']) for n in recipe['nodes']}) == len(recipe['nodes'])
+
+
+def test_shots_follow_story_order_in_one_vertical_column(modules, project):
+    native = sys.modules[modules.node.__name__ + '.storyboard.native']
+    project['shots'] = [{**copy.deepcopy(project['shots'][0]), 'id': f'shot{i}'} for i in range(1, 5)]
+    recipe = native.native_canvas(modules.store, project, project['chapters'][0]['id'])
+    frames = [node for node in recipe['nodes'] if node['properties']['astrogate_kind'] == 'shot']
+    assert [node['id'] for node in frames] == ['shot1', 'shot2', 'shot3', 'shot4']
+    assert len({node['pos'][0] for node in frames}) == 1
+    assert [node['pos'][1] for node in frames] == [80, 800, 1520, 2240]
+    assert [node['properties']['astrogate_layout_version'] for node in frames] == [5] * 4
 
 
 def test_shot_uses_only_visible_character_sheets_and_costumes_stay_text(modules, project):
@@ -1365,6 +1376,43 @@ async def test_background_images_finish_independently_when_one_request_stalls(mo
     release_slow.set()
     await asyncio.wait_for(slow, 2)
     assert modules.store.job(jobs['slow']['id'])['status'] == 'succeeded'
+
+
+async def test_background_image_waits_in_queue_until_request_slot_is_free(modules, project, monkeypatch, tmp_path):
+    m = modules.node
+    native = sys.modules[m.__name__ + '.storyboard.native']
+    shots = [{**copy.deepcopy(project['shots'][0]), 'id': name} for name in ('first', 'second')]
+    project['shots'] = shots
+    modules.store.change(project['id'], lambda p: p.update(shots=shots))
+    jobs = []
+    for shot in shots:
+        job = native.prepare_native(modules.store, project, {'owner_id': shot['id'], 'owner_type': 'shot',
+            'prompt': shot['image_prompt'], 'settings': {'resolution': 'original', 'aspect_ratio': '16:9', 'quality': 'high'}})
+        modules.store.update_job(job['id'], expected_status=('prepared',), status='queued')
+        jobs.append(job)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def generate(payload, edit):
+        started.set()
+        await release.wait()
+        data = BytesIO()
+        Image.new('RGB', (16, 9), 'blue').save(data, format='PNG')
+        return {'data': [{'b64_json': m.base64.b64encode(data.getvalue()).decode()}]}
+
+    monkeypatch.setattr(m, 'generate_image', generate)
+    monkeypatch.setattr(m, 'frame_queue', m.FrameQueue(1))
+    monkeypatch.setattr(m.folder_paths, 'output_directory', str(tmp_path / 'output'))
+    (tmp_path / 'output').mkdir()
+    first = asyncio.create_task(m.generate_prepared_frame(jobs[0]['id']))
+    await asyncio.wait_for(started.wait(), 2)
+    second = asyncio.create_task(m.generate_prepared_frame(jobs[1]['id']))
+    await asyncio.sleep(0.01)
+    assert modules.store.job(jobs[0]['id'])['status'] == 'running'
+    assert modules.store.job(jobs[1]['id'])['status'] == 'queued'
+    release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), 2)
+    assert all(modules.store.job(job['id'])['status'] == 'succeeded' for job in jobs)
 
 
 @pytest.mark.parametrize('failure', ['before_request', 'unknown'])

@@ -47,6 +47,27 @@ test("generated storyboard frame connects to a local MiniMax H3 video and save n
     assert.equal(await addVideoNode(frame), video);
     assert.equal(graph._nodes.length, 3);
 });
+test("vertical shot layout migration keeps completed images and edited prompts", async () => {
+    const {graph, LiteGraph} = graphMock(); graph.change = () => {};
+    const board = LiteGraph.createNode("AstroGateStoryboard"); board.pos = [0, 0]; graph.add(board);
+    const app = {registerExtension() {}, graph, nodeOutputs: {}};
+    const {mountGraph} = await load(app, {LiteGraph});
+    const item = (id, pos, version) => ({id, type: "AstroGateStoryboardFrame", title: id, pos,
+        widgets: {prompt: id, job_id: "job-" + id, aspect_ratio: "16:9", resolution: "4K", quality: "high"},
+        properties: {astrogate_project: "p", astrogate_owner: id, astrogate_key: id, astrogate_kind: "shot",
+            astrogate_layout_version: version, astrogate_base_prompt: id, astrogate_images: [{filename: id + ".png"}]}});
+    const old = {project_id: "p", chapter_id: "c", layout_version: 4, reference_wiring_version: 4,
+        nodes: [item("s1", [500, 80], 4), item("s2", [1000, 80], 4)], links: []};
+    const first = mountGraph(board, old).get("s1");
+    first.widgets.find(w => w.name === "prompt").value = "人工修改";
+    const next = {...old, layout_version: 5,
+        nodes: [item("s1", [500, 80], 5), item("s2", [500, 800], 5)]};
+    const mapping = mountGraph(board, next, true);
+    assert.deepEqual(Array.from(mapping.get("s1").pos), [500, 80]);
+    assert.deepEqual(Array.from(mapping.get("s2").pos), [500, 800]);
+    assert.equal(first.widgets.find(w => w.name === "prompt").value, "人工修改");
+    assert.equal(first.properties.astrogate_images[0].filename, "s1.png");
+});
 test("legacy folding preserves values, references and output previews", async () => {
     const app = {registerExtension() {}, nodeOutputs: {}};
     const {installFold} = await load(app);

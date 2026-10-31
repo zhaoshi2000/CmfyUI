@@ -1465,7 +1465,7 @@ async function poll() {
                     await buildBoard(node, {project_id: project, chapter_id: job.chapter_id, analysis_id: job.id}, false, true);
                     node.properties.astrogate_partial_progress = {job_id: job.id, chunks: job.completed_chunks};
                 }
-                if (job?.status === "succeeded" && !busy && (node.properties.astrogate_board?.analysis_id !== job.id || partial?.job_id === job.id || (!node.agLayoutChecked && node.properties.astrogate_layout_version !== 4) || !node.agWiringChecked)) {
+                if (job?.status === "succeeded" && !busy && (node.properties.astrogate_board?.analysis_id !== job.id || partial?.job_id === job.id || (!node.agLayoutChecked && node.properties.astrogate_layout_version !== 5) || !node.agWiringChecked)) {
                     delete node.properties.astrogate_resume_job;
                     await buildBoard(node, {project_id: project, chapter_id: job.chapter_id, analysis_id: job.id});
                     delete node.properties.astrogate_partial_progress;

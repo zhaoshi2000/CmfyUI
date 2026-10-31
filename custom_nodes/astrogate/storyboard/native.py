@@ -126,7 +126,7 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
             prompt = job["snapshot"]["shot"]["image_prompt"]
         props = {"astrogate_project": project["id"], "astrogate_owner": owner["id"], "astrogate_owner_type": "shot" if kind == "shot" else "asset",
                  "astrogate_kind": kind, "astrogate_key": key, "astrogate_base_prompt": prompt, "astrogate_prompt_folded": True,
-                 "astrogate_view": view, "astrogate_layout_version": 4,
+                 "astrogate_view": view, "astrogate_layout_version": 5,
                  "astrogate_images": [job["saved_result"]] if job and job.get("saved_result") else []}
         if kind == "shot":
             props["astrogate_atmosphere"] = owner.get("atmosphere", "")
@@ -204,9 +204,8 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
 
     for index, shot in enumerate(shots):
         scene_id = (shot.get("scene") or {}).get("asset_id", "none")
-        # Chronological rows stay readable while assets are shared on the left.
         job = next((j for j in jobs if j["id"] == shot.get("latest_job_id")), None)
-        add(shot, "shot", shot["image_prompt"], [shot_column + (index % 3) * 500, 80 + (index // 3) * 800], job)
+        add(shot, "shot", shot["image_prompt"], [shot_column, 80 + index * 720], job)
         refs = []
         seen = set()
         for person in shot.get("participants", []):
@@ -225,7 +224,7 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
             links.append({"from": shots[index - 1]["id"], "slot": 1, "to": shot["id"], "input": "story_context", "type": "ASTROGATE_STORY", "label": "叙事顺序"})
         nodes[-1]["title"] = " · ".join(str(part) for part in (f"{index + 1:03d}", shot.get("shot_size"), shot["summary"]) if part)
         nodes[-1]["properties"]["astrogate_scene"] = asset_by_id(project, scene_id)["name"] if scene_id != "none" else "空镜 / 未指定场景"
-    return {"project_id": project["id"], "chapter_id": chapter_id, "layout_version": 4, "reference_wiring_version": 4,
+    return {"project_id": project["id"], "chapter_id": chapter_id, "layout_version": 5, "reference_wiring_version": 4,
             "character_aliases": character_aliases, "nodes": nodes, "links": links}
 
 

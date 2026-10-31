@@ -300,34 +300,34 @@ async def generate_prepared_frame(job_id):
             if all(source["status"] == "succeeded" for source in sources):
                 break
             await asyncio.sleep(1)
-        ordered = sorted(job["references"], key=lambda ref: int(ref["slot"].rsplit("_", 1)[1]))
-        references = []
-        for index, ref in enumerate(ordered):
-            source = store.job(ref["job_id"])
-            with Image.open(store.image_path(source["result_image"]["file"])) as opened:
-                data, encoding = encode_reference(opened.convert("RGB"))
-            references.append({"b64_json": base64.b64encode(data).decode(), "filename": f"reference-{index + 1}.{encoding}", "mime_type": f"image/{encoding}"})
-            ref["image"] = source["result_image"]
-        if references:
-            references, ordered = pack_character_views(references, ordered)
-        if len(references) > 8:
-            raise ValueError("本镜超过接口的8张参考图限制，请只连接必要的出镜人物。")
-        settings = job["settings"]
-        width, height = output_dimensions(settings["aspect_ratio"], settings["resolution"])
-        payload = {"model": "gpt-image-2", "prompt": render_prompt(job["snapshot"], ordered),
-                   "size": f"{width}x{height}", "quality": settings["quality"], "n": 1,
-                   "stream": False, "response_format": "b64_json", "gateway_request_id": job["gateway_request_id"]}
-        if references:
-            payload["images"] = references
-        read_api_key()
-        image_timeout()
-        request_path = store.root / "requests" / f"{job_id}.json"
-        request_path.parent.mkdir(exist_ok=True)
-        serialized = json.dumps(payload, ensure_ascii=False).encode()
-        request_path.write_bytes(serialized)
-        store.update_job(job_id, expected_status=("queued",), status="running", references=ordered,
-                         prompt=payload["prompt"], request_hash=hashlib.sha256(serialized).hexdigest())
         async with frame_queue.slot():
+            ordered = sorted(job["references"], key=lambda ref: int(ref["slot"].rsplit("_", 1)[1]))
+            references = []
+            for index, ref in enumerate(ordered):
+                source = store.job(ref["job_id"])
+                with Image.open(store.image_path(source["result_image"]["file"])) as opened:
+                    data, encoding = encode_reference(opened.convert("RGB"))
+                references.append({"b64_json": base64.b64encode(data).decode(), "filename": f"reference-{index + 1}.{encoding}", "mime_type": f"image/{encoding}"})
+                ref["image"] = source["result_image"]
+            if references:
+                references, ordered = pack_character_views(references, ordered)
+            if len(references) > 8:
+                raise ValueError("本镜超过接口的8张参考图限制，请只连接必要的出镜人物。")
+            settings = job["settings"]
+            width, height = output_dimensions(settings["aspect_ratio"], settings["resolution"])
+            payload = {"model": "gpt-image-2", "prompt": render_prompt(job["snapshot"], ordered),
+                       "size": f"{width}x{height}", "quality": settings["quality"], "n": 1,
+                       "stream": False, "response_format": "b64_json", "gateway_request_id": job["gateway_request_id"]}
+            if references:
+                payload["images"] = references
+            read_api_key()
+            image_timeout()
+            request_path = store.root / "requests" / f"{job_id}.json"
+            request_path.parent.mkdir(exist_ok=True)
+            serialized = json.dumps(payload, ensure_ascii=False).encode()
+            request_path.write_bytes(serialized)
+            store.update_job(job_id, expected_status=("queued",), status="running", references=ordered,
+                             prompt=payload["prompt"], request_hash=hashlib.sha256(serialized).hexdigest())
             try:
                 response = await generate_image(payload, bool(references))
                 image = decode_image(response, (width, height) if settings["resolution"] != "original" else None)
