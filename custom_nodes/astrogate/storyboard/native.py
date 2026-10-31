@@ -4,6 +4,7 @@ import secrets
 from .analysis import analyse
 from .graph import CHARACTER_SHEET_PROMPT, SCENE_MASTER_PROMPT, SCENE_STATE_PROMPT, render_prompt, snapshot
 from .store import aspect_ratio, asset_by_id, binding, digest, invalidate, shot_bindings, version
+from .video import shot_video_prompt
 
 
 PREVIOUS_SCENE_MASTER_PROMPT = "无人环境素材：生成一张16:9连续的场景全景母图，24mm等效广角、平视机位，中远距离全景，在同一画面尽可能完整交代房间或场地的空间。室内清楚展示墙面、地面、顶面、门窗、通道及主要陈设的相对位置；室外对应展示地形、建筑、道路、植被及主要空间边界。结构与透视合理，画面边缘无明显拉伸，保留设定中的材质、布局、主要光源方向、色温和投影关系，以真实光照呈现，明确光照强度，不添加不合理的多方向光源，不加说明标记。画面中禁止出现任何人物、路人、人体、剪影或人物倒影；参考图中即使有人也必须移除。不绘制剧情事件，只用一个连续机位，不拼贴、不分屏、不做多角度拼图，无文字、标签或水印。"
@@ -129,6 +130,7 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
                  "astrogate_images": [job["saved_result"]] if job and job.get("saved_result") else []}
         if kind == "shot":
             props["astrogate_atmosphere"] = owner.get("atmosphere", "")
+            props["astrogate_video_prompt"] = shot_video_prompt(project, owner)
             props["astrogate_unresolved_scene"] = bool(owner.get("unresolved_scene_id"))
             props["astrogate_unresolved_source"] = bool(owner.get("source_refs_needs_review"))
             props["astrogate_unresolved_people"] = bool(owner.get("unresolved_participants"))

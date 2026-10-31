@@ -1,6 +1,39 @@
 from .store import asset_by_id, version
 
 
+def shot_video_prompt(project, shot):
+    action = shot.get("video_action") or shot.get("frozen_moment") or shot["summary"]
+    if any(word in action.lower() for word in ("bgm", "背景音乐", "配乐", "字幕", "画内文字")):
+        action = shot.get("frozen_moment") or shot["summary"]
+    camera = "，".join(part for part in (shot.get("shot_size"), shot.get("camera_angle")) if part)
+    lines = ["以连接的分镜图像为首帧，保持其中人物身份、服装、构图、场景布局、材质和光线一致。",
+             f"本镜景别与机位：{camera}。" if camera else "保持首帧景别与机位。",
+             f"本镜动作与运镜：{action}。动作自然连贯，镜头只表现这一镜，不提前切入下一分镜。",
+             "24fps、1/48 快门、正常速度，电影级真人实拍质感；不慢放、不加速、不抽帧。"]
+    visible = {person["identity"]["asset_id"] for person in shot.get("participants", []) if person.get("visible") is True}
+    dialogues = {item["id"]: item for item in project.get("dialogues", [])}
+    for link in shot.get("dialogue_links", []):
+        dialogue = dialogues.get(link.get("dialogue_id"))
+        if not dialogue or link.get("needs_review") or dialogue["source"] == "adapted" and dialogue.get("status") != "confirmed":
+            continue
+        start, end = link.get("start"), link.get("end")
+        if link.get("mode") == "audio_only":
+            lines.append("上一镜的说话声只延续尾音，本镜不重新朗读整句。")
+            continue
+        if type(start) is not int or type(end) is not int or not 0 <= start < end <= len(dialogue["text"]):
+            continue
+        character = asset_by_id(project, dialogue.get("character_id"))
+        if not character:
+            continue
+        source = "画外音" if dialogue["type"] in ("narration", "voiceover", "inner") or character["id"] not in visible else "对白"
+        lines.append(f"{character['name']}{source}：{{{dialogue['text'][start:end]}}}。画外说话人不因此出现在画面。")
+    sounds = [cue for cue in shot.get("sound_cues", []) if not any(word in cue.lower() for word in ("bgm", "背景音乐", "配乐"))]
+    if sounds:
+        lines.append("只保留与动作相符的现场声：" + "、".join(sounds) + "。")
+    lines.append("严禁 BGM、配乐、歌曲、字幕、新增画内文字和水印；不得额外增加人物、道具或镜头切换。")
+    return "\n".join(lines)
+
+
 def video_prompt(project, chapter_id, analysis_id=None, jobs=()):
     shots = [shot for shot in project["shots"] if shot["chapter_id"] == chapter_id
              and (analysis_id is None or shot.get("analysis_id") == analysis_id)]

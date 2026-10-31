@@ -7,7 +7,7 @@ import { webcrypto } from "node:crypto";
 const source = await readFile(new URL("../web/storyboard.js", import.meta.url), "utf8");
 async function load(app, extras = {}, api = {}) {
     const context = vm.createContext({queueMicrotask, structuredClone, console, JSON, Set, Map, URLSearchParams, TextEncoder, crypto: webcrypto, ...extras});
-    const module = new vm.SourceTextModule(source + "\nexport { installFold, mountGraph, changed, generate, installFrame, installDialogue, analysisContext, startAnalysis, showAnalysisState, poll, panelWidget, activityStatus, activityLines, message, createActivityPanel, buildBoard, applyFrameAspect, batchProgress, addSceneAngle, nodeSignature, upgradeSignature };", {context});
+    const module = new vm.SourceTextModule(source + "\nexport { installFold, mountGraph, changed, generate, installFrame, installDialogue, analysisContext, startAnalysis, showAnalysisState, poll, panelWidget, activityStatus, activityLines, message, createActivityPanel, buildBoard, applyFrameAspect, batchProgress, addSceneAngle, addVideoNode, nodeSignature, upgradeSignature };", {context});
     await module.link(async specifier => {
         const name = specifier.includes("app.js") ? "app" : "api";
         return new vm.SyntheticModule([name], function () { this.setExport(name, name === "app" ? app : api); }, {context});
@@ -31,6 +31,22 @@ function graphMock() {
     }};
     return {graph, LiteGraph};
 }
+test("generated storyboard frame connects to a local MiniMax H3 video and save node", async () => {
+    const {graph, LiteGraph} = graphMock(); graph.change = () => {};
+    const frame = LiteGraph.createNode("AstroGateStoryboardFrame"); graph.add(frame);
+    frame.pos = [0, 0]; frame.size = [430, 400];
+    frame.properties = {astrogate_kind: "shot", astrogate_images: [{filename: "frame.png"}],
+        astrogate_video_prompt: "人物走向门口。严禁 BGM 和字幕。"};
+    const app = {registerExtension() {}, graph, canvas: {ds: {}, centerOnNode() {}, selectNode() {}}};
+    const {addVideoNode} = await load(app, {LiteGraph});
+    const video = await addVideoNode(frame);
+    assert.equal(video.type, "AstroGateMiniMaxH3Video");
+    assert.equal(video.inputs.find(i => i.name === "first_frame").link != null, true);
+    assert.equal(video.widgets.find(w => w.name === "prompt").value, frame.properties.astrogate_video_prompt);
+    assert.equal(graph._nodes.find(n => n.type === "SaveVideo").inputs.find(i => i.name === "video").link != null, true);
+    assert.equal(await addVideoNode(frame), video);
+    assert.equal(graph._nodes.length, 3);
+});
 test("legacy folding preserves values, references and output previews", async () => {
     const app = {registerExtension() {}, nodeOutputs: {}};
     const {installFold} = await load(app);

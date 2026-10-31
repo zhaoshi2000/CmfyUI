@@ -559,6 +559,7 @@ function mountGraph(board, recipe, relayout = false) {
             if (unchanged && node.properties.astrogate_signature) node.properties.astrogate_signature = nodeSignature(node);
         }
         if (item.properties.astrogate_kind === "shot" && node.properties.astrogate_atmosphere === undefined) node.properties.astrogate_atmosphere = item.properties.astrogate_atmosphere || "";
+        if (item.properties.astrogate_kind === "shot" && node.properties.astrogate_video_prompt === undefined) node.properties.astrogate_video_prompt = item.properties.astrogate_video_prompt || "";
         node.properties.astrogate_chapter = recipe.chapter_id;
         node.agRefresh?.();
         restorePreview(node);
@@ -663,6 +664,28 @@ async function addSceneAngle(source, view) {
     if (board) await saveBoard(board);
     focusNode(node);
     return node;
+}
+async function addVideoNode(source) {
+    if (source.properties.astrogate_kind !== "shot") throw new Error("请从分镜帧创建视频节点。");
+    if (!source.properties.astrogate_images?.length) throw new Error("请先生成这一镜的图像。");
+    const prompt = String(source.properties.astrogate_video_prompt || "").trim();
+    if (!prompt) throw new Error("请先填写本镜视频提示词。");
+    const model = source.properties.astrogate_video_model || "minimax_h3";
+    const type = model === "jimeng" ? "AstroGateJimengImageToVideo" : "AstroGateMiniMaxH3Video";
+    let video = nodes().find(n => n.type === type && n.properties.astrogate_video_source === source.id);
+    if (!video) {
+        video = addNode(type, [source.pos[0] + source.size[0] + 100, source.pos[1]]);
+        video.properties.astrogate_video_source = source.id;
+        const save = addNode("SaveVideo", [video.pos[0] + (video.size?.[0] || 360) + 90, video.pos[1]]);
+        connect(video, 0, save, "video", "VIDEO");
+    }
+    setValue(video, "prompt", prompt);
+    connect(source, 0, video, model === "jimeng" ? "image" : "first_frame", "IMAGE");
+    app.graph.change();
+    const board = sourceNode(source, "board");
+    if (board) await saveBoard(board);
+    focusNode(video);
+    return video;
 }
 async function buildBoard(board, info, relayout = false, partial = false) {
     if (board.agBuilding) return board.agBuilding;
@@ -1023,6 +1046,8 @@ function installBoard(node) {
 function installFrame(node) {
     node.properties.astrogate_prompt_folded ??= true;
     node.properties.astrogate_references_folded ??= true;
+    node.properties.astrogate_video_folded ??= true;
+    node.properties.astrogate_video_model ??= "minimax_h3";
     for (const w of node.widgets) if (["prompt", "job_id", "element_id", "aspect_ratio", "resolution", "quality"].includes(w.name)) w.hidden = true;
     node.hideOutputImages = true;
     const root = element("div", undefined, "ag-native ag-image-card");
@@ -1161,6 +1186,31 @@ function installFrame(node) {
     detail.append(summary, prompt, atmosphereField, parameters);
     detail.addEventListener("toggle", () => {
         node.properties.astrogate_prompt_folded = !detail.open;
+        resizeCard();
+    });
+    const videoDetail = element("details");
+    videoDetail.open = !node.properties.astrogate_video_folded;
+    const videoSummary = element("summary", "视频提示词 · 展开");
+    const videoPrompt = element("textarea");
+    videoPrompt.placeholder = "描述本镜动作、运镜、台词和现场声音…";
+    videoPrompt.addEventListener("input", () => {
+        node.properties.astrogate_video_prompt = videoPrompt.value;
+        for (const target of nodes().filter(n => n.properties?.astrogate_video_source === node.id)) setValue(target, "prompt", videoPrompt.value);
+        app.graph.change();
+    });
+    const videoModel = element("select");
+    for (const [id, label] of [["minimax_h3", "MiniMax H3 · 本机模型"], ["jimeng", "即梦 · 网页图生视频"]]) {
+        const option = element("option", label);
+        option.value = id;
+        videoModel.append(option);
+    }
+    videoModel.addEventListener("change", () => { node.properties.astrogate_video_model = videoModel.value; app.graph.change(); });
+    const videoControls = element("div", undefined, "ag-native-actions");
+    videoControls.append(videoModel, button(node, "创建视频节点", () => addVideoNode(node)));
+    videoDetail.append(videoSummary, videoPrompt, videoControls);
+    videoDetail.addEventListener("toggle", () => {
+        node.properties.astrogate_video_folded = !videoDetail.open;
+        videoSummary.textContent = `视频提示词 · ${videoDetail.open ? "收起" : "展开"}`;
         resizeCard();
     });
     panelWidget(node, root, cardHeight);
@@ -1322,7 +1372,7 @@ function installFrame(node) {
         }
         resizeCard();
     };
-    content.append(referenceToggle, referenceList, stage, controls, progressBar(node), detail, sceneNotice, sourceNotice, peopleNotice, node.agStatus, dialogue);
+    content.append(referenceToggle, referenceList, stage, controls, progressBar(node), detail, videoDetail, sceneNotice, sourceNotice, peopleNotice, node.agStatus, dialogue);
     node.agRefresh = () => {
         const kind = node.properties.astrogate_kind;
         if (kindColors[kind]) {
@@ -1338,6 +1388,11 @@ function installFrame(node) {
         if (scene && !String(value(node, "prompt")).includes(sceneOnly)) setValue(node, "prompt", `${value(node, "prompt") || ""}\n${sceneOnly}`);
         if (node.properties.astrogate_kind === "prop" && !String(value(node, "prompt")).includes(propOnly)) setValue(node, "prompt", `${value(node, "prompt") || ""}\n${propOnly}`);
         prompt.value = value(node, "prompt") || "";
+        videoDetail.hidden = node.properties.astrogate_kind !== "shot";
+        videoDetail.open = !node.properties.astrogate_video_folded;
+        videoSummary.textContent = `视频提示词 · ${videoDetail.open ? "收起" : "展开"}`;
+        videoPrompt.value = node.properties.astrogate_video_prompt || "";
+        videoModel.value = node.properties.astrogate_video_model || "minimax_h3";
         atmosphere.value = node.properties.astrogate_atmosphere || "";
         atmosphereField.hidden = node.properties.astrogate_kind !== "shot";
         for (const [select, w] of selects) select.value = w.value;

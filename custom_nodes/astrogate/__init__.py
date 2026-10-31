@@ -22,6 +22,7 @@ from comfy_execution.graph_utils import ExecutionBlocker
 from server import PromptServer
 
 from .jimeng import AstroGateJimengImageToVideo, register_jimeng_routes
+from .h3_video import AstroGateMiniMaxH3Video
 from .storyboard.graph import render_prompt, semantic_hash, snapshot
 from .storyboard.native import analyse_native
 from .storyboard.service import get_store, register_routes
@@ -680,7 +681,8 @@ class AstroGateVideoPrompt(io.ComfyNode):
 
 class AstroGateExtension(ComfyExtension):
     async def get_node_list(self):
-        return [AstroGateImage, AstroGateStoryboardFrame, AstroGateTXT, AstroGateStoryboard, AstroGateVideoPrompt, AstroGateJimengImageToVideo]
+        return [AstroGateImage, AstroGateStoryboardFrame, AstroGateTXT, AstroGateStoryboard, AstroGateVideoPrompt,
+                AstroGateJimengImageToVideo, AstroGateMiniMaxH3Video]
 
 
 async def comfy_entrypoint():
