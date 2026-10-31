@@ -2,7 +2,7 @@ import copy
 import secrets
 
 from .analysis import analyse
-from .graph import CHARACTER_SHEET_PROMPT, SCENE_MASTER_PROMPT, render_prompt, snapshot
+from .graph import CHARACTER_SHEET_PROMPT, SCENE_MASTER_PROMPT, SCENE_STATE_PROMPT, render_prompt, snapshot
 from .store import aspect_ratio, asset_by_id, binding, digest, invalidate, shot_bindings, version
 
 
@@ -184,7 +184,7 @@ def native_canvas(store, project, chapter_id, analysis_id=None):
                 prompt += f"\n本卡基准造型：{look['name']}，{version(look, sheet_look['version_id'])['description']}"
             prompt += "\n" + CHARACTER_SHEET_PROMPT
         elif asset["kind"] in ("scene", "scene_state"):
-            prompt += "\n" + SCENE_MASTER_PROMPT
+            prompt += "\n" + (SCENE_STATE_PROMPT if asset["kind"] == "scene_state" else SCENE_MASTER_PROMPT)
         add(asset, asset["kind"], prompt, positions[key], job, key, view)
         if key != asset["id"]:
             nodes[-1]["title"] += " · 固定版本"

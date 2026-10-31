@@ -54,13 +54,19 @@ def test_scene_request_is_one_empty_continuous_environment_panorama(modules, pro
     shot = native.asset_shot(project, asset)
     prompt = modules.graph.render_prompt(modules.graph.snapshot(project, shot), [{'purpose': '同一场地空间基准'}])
     assert description in prompt
-    assert '一张16:9连续的场景全景母图，24mm等效广角、平视机位' in prompt
-    assert '门窗、通道及主要陈设的相对位置' in prompt
-    assert '室外对应展示地形、建筑、道路、植被' in prompt
-    assert '主要光源方向、色温和投影关系' in prompt
-    assert '禁止出现任何人物' in prompt and '参考图中即使有人也必须移除' in prompt
-    assert '只用一个连续机位，不拼贴、不分屏、不做多角度拼图' in prompt
-    assert '无文字、标签或水印' in prompt
+    if kind == 'scene':
+        assert '一张16:9连续的场景全景母图，24mm等效广角、平视机位' in prompt
+        assert '门窗、通道及主要陈设的相对位置' in prompt
+        assert '室外对应展示地形、建筑、道路、植被' in prompt
+        assert '主要光源方向、色温和投影关系' in prompt
+        assert '禁止出现任何人物' in prompt and '参考图中即使有人也必须移除' in prompt
+        assert '只用一个连续机位，不拼贴、不分屏、不做多角度拼图' in prompt
+    else:
+        assert '一张16:9连续的同场景补充全景' in prompt
+        assert '与母图明显不同的空间透视' in prompt
+        assert '不要复制母图的机位' in prompt
+        assert '不擅自改变已经确定的布局' in prompt
+    assert '文字、标签或水印' in prompt
     assert '画风：自然写实电影' in prompt
     assert '头部至胸部特写' not in prompt
 

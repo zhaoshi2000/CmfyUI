@@ -977,7 +977,8 @@ test('extra scene angles are manual independent nodes referencing one base scene
     assert.equal(left.properties.astrogate_view,'scene_left');
     assert.equal(left.widgets[1].value,'');
     assert.equal(left.properties.astrogate_images.length,0);
-    assert.match(left.widgets[0].value,/左侧机位.*仅改变摄影机/);
+    assert.match(left.widgets[0].value,/左侧机位.*明显不同的透视和裁切/);
+    assert.match(left.widgets[0].value,/不镜像翻转或改变建筑、家具/);
     const ref=left.inputs.find(i=>i.name==='reference_images.reference_1');
     assert.equal(graph.links[ref.link].origin_id,source.id);
     assert.equal(await addSceneAngle(source,'scene_left'),left);

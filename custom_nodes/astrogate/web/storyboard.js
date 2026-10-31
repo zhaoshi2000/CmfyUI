@@ -644,7 +644,7 @@ async function addSceneAngle(source, view) {
     delete node.properties.astrogate_signature;
     delete node.properties.astrogate_status;
     node.title = `${source.title} · ${sceneAngles[view]}`;
-    const prompt = `${value(source, "prompt")}\n根据参考图改为${sceneAngles[view]}，仅改变摄影机位置和朝向，保留建筑结构、家具位置与光照关系；独立单幅，不拼贴。\n${sceneOnly}`;
+    const prompt = `${value(source, "prompt")}\n本张使用${sceneAngles[view]}，与参考母图明显不同的透视和裁切；展示母图遮挡的入口、侧墙、通道及家具关系，前中远景均有空间信息。只移动摄影机，不镜像翻转或改变建筑、家具与主光源的位置；独立单幅，不拼贴。\n${sceneOnly}`;
     for (const name of ["element_id", "aspect_ratio", "resolution", "quality"]) setValue(node, name, value(source, name));
     setValue(node, "prompt", prompt);
     setValue(node, "job_id", "");
