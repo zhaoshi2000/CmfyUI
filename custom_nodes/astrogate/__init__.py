@@ -53,7 +53,7 @@ VIEW_PROMPTS = {
 
 class FrameQueue:
     def __init__(self, limit=None):
-        self.limit = int(os.environ.get("ASTROGATE_IMG_CONCURRENCY", "4")) if limit is None else limit
+        self.limit = int(os.environ.get("ASTROGATE_IMG_CONCURRENCY", "20")) if limit is None else limit
         if self.limit < 1:
             raise ValueError("ASTROGATE_IMG_CONCURRENCY 必须是正整数。")
         self.semaphore = None
