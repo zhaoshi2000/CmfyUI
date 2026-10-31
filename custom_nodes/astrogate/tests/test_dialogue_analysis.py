@@ -47,6 +47,21 @@ def test_invalid_ai_dialogue_is_rejected(modules, project, change, error):
         modules.analysis.merge_shots(project, project["chapters"][0]["id"], {"dialogues": [dialogue], "shots": [shot]}, {paragraph["id"]}, "a")
 
 
+def test_dialogue_repairs_wrong_paragraph_id_only_with_unique_exact_text(modules, project):
+    paragraph, dialogue, shot = setup_dialogue(project)
+    dialogue["source_refs"] = [{"paragraph_id": "invented", "quote": "两人在客栈相遇"}]
+    modules.analysis.merge_shots(project, project["chapters"][0]["id"],
+                                 {"dialogues": [dialogue], "shots": [shot]}, {paragraph["id"]}, "a", [paragraph])
+    assert project["dialogues"][-1]["source_refs"] == [{"paragraph_id": paragraph["id"], "quote": "两人在客栈相遇"}]
+
+    dialogue["local_id"] = "d2"
+    dialogue["text"] = "原文也没有这句"
+    dialogue["source_refs"] = [{"paragraph_id": "invented", "quote": "原文没有这句"}]
+    with pytest.raises(ValueError, match="不在本次正文"):
+        modules.analysis.merge_shots(project, project["chapters"][0]["id"],
+                                     {"dialogues": [dialogue], "shots": [shot]}, {paragraph["id"]}, "a", [paragraph])
+
+
 def test_codepoint_offsets_and_old_drafts(modules, project):
     paragraph, dialogue, shot = setup_dialogue(project)
     dialogue.update(text="你好😀！", source="adapted")

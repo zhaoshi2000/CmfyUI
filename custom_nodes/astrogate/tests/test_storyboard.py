@@ -565,6 +565,16 @@ def test_quote_fallback_does_not_accept_invalid_paragraphs(modules, project, out
         modules.analysis.merge_assets(project, {"assets": [{"kind": "scene", **item}]}, allowed)
 
 
+def test_asset_keeps_valid_sources_and_flags_unmatched_extra_reference(modules, project):
+    ref = project["shots"][0]["source_refs"][0]
+    invalid = {"paragraph_id": "invented", "quote": None}
+    candidate = {"local_id": "a1", "existing_id": "林夏", "kind": "character", "source_refs": [ref, invalid]}
+    modules.analysis.merge_assets(project, {"assets": [candidate]}, {ref["paragraph_id"]})
+    suggestion = modules.domain.asset_by_id(project, "林夏")["suggestions"][-1]
+    assert suggestion["source_refs"] == [ref]
+    assert suggestion["unresolved_source_refs"] == [invalid]
+
+
 async def test_native_analysis_surfaces_original_failure(modules, project):
     native = sys.modules[modules.node.__name__ + ".storyboard.native"]
     key = modules.domain.digest([project["source"]["hash"], project["chapters"][0]["id"], "gpt-5.6-terra", "写实", "精细", 0])

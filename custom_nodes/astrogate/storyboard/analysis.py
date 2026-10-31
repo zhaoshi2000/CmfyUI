@@ -173,12 +173,21 @@ def merge_assets(project, draft, paragraph_ids, section=None):
     for candidate in draft["assets"]:
         if candidate["kind"] not in ("character", "look", "scene", "scene_state", "prop"):
             raise ValueError("未知素材类别。")
-        refs = candidate["source_refs"]
-        for ref in refs:
-            if isinstance(ref, dict) and ref.get("paragraph_id") not in paragraph_ids and ref.get("quote"):
-                matches = {p["id"] for p in (section or []) if ref["quote"] in p["text"]}
+        refs, unresolved_sources = [], []
+        for ref in candidate["source_refs"]:
+            if isinstance(ref, dict) and ref.get("paragraph_id") not in paragraph_ids:
+                matches = {p["id"] for p in (section or []) if ref.get("quote") and ref["quote"] in p["text"]}
                 if len(matches) == 1:
                     ref["paragraph_id"] = next(iter(matches))
+                else:
+                    unresolved_sources.append(ref)
+                    continue
+            refs.append(ref)
+        if unresolved_sources:
+            candidate["source_refs"] = refs
+            candidate["unresolved_source_refs"] = unresolved_sources
+            if not refs:
+                raise ValueError("分析结果引用了不在本次正文中的段落。")
         check_sources(project, refs, paragraph_ids)
         existing = candidate.get("existing_id")
         if existing:
@@ -199,6 +208,7 @@ def merge_assets(project, draft, paragraph_ids, section=None):
         project["assets"].append({"id": asset_id, "kind": candidate["kind"], "name": candidate["name"],
                                   "parent_id": parent, "aliases": candidate.get("aliases", []),
                                   "source_refs": candidate["source_refs"], "inferred": candidate.get("inferred", False),
+                                  **({"unresolved_source_refs": unresolved_sources} if unresolved_sources else {}),
                                   "current_version_id": version_id, "versions": [{"id": version_id,
                                   "parent_version_id": asset_by_id(project, parent)["current_version_id"] if parent else None,
                                   "description": candidate["description"], "image": None}]})
@@ -220,8 +230,16 @@ def merge_shots(project, chapter_id, draft, paragraph_ids, analysis_id, section=
         if local_id in dialogue_ids:
             raise ValueError("AI 返回重复台词 ID。")
         refs = candidate["source_refs"]
-        check_sources(project, refs, paragraph_ids)
         text = candidate["text"]
+        for ref in refs:
+            if not isinstance(ref, dict) or ref.get("paragraph_id") in paragraph_ids:
+                continue
+            matches = {p["id"] for p in (section or []) if ref.get("quote") and ref["quote"] in p["text"]}
+            if not matches and candidate.get("source") == "original":
+                matches = {p["id"] for p in (section or []) if text in p["text"]}
+            if len(matches) == 1:
+                ref["paragraph_id"] = next(iter(matches))
+        check_sources(project, refs, paragraph_ids)
         if not isinstance(text, str) or not text.strip():
             raise ValueError("AI 返回了空台词。")
         source = candidate.get("source")
